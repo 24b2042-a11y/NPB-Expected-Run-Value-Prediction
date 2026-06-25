@@ -183,8 +183,23 @@ def predict_all(re24, df_woba, league_avg,
 # モデル一括構築（キャッシュ用）
 # ============================================================
 def build_model(details_dir: str, batter_csv: str):
-    all_df, n_games = load_all_details(details_dir)
-    df_runs         = calc_runs_after(all_df)
-    re24, counts    = build_re24(df_runs)
+    # データなし → RE24はNaN埋めで返し、予測タブ側で案内する
+    os.makedirs(details_dir, exist_ok=True)
+    files = glob.glob(os.path.join(details_dir, '*_details.csv'))
+    if files:
+        all_df, n_games = load_all_details(details_dir)
+        df_runs         = calc_runs_after(all_df)
+        re24, counts    = build_re24(df_runs)
+        n_pa            = len(all_df)
+    else:
+        re24   = pd.DataFrame(
+            np.full((3, 8), np.nan),
+            index=pd.Index([0, 1, 2], name='アウト'),
+            columns=pd.Index(RUNNER_LABEL, name='ランナー状態'),
+        )
+        counts  = np.zeros((3, 8), dtype=int)
+        n_games = 0
+        n_pa    = 0
+
     df_woba, league_avg = build_batter_woba(batter_csv)
-    return re24, counts, df_woba, league_avg, n_games, len(all_df)
+    return re24, counts, df_woba, league_avg, n_games, n_pa
