@@ -131,8 +131,7 @@ def tab_scraper():
     col1, col2, col3 = st.columns(3)
     with col1:
         start_id = st.number_input(
-            '開始 ID', min_value=2000000000, max_value=2099999999,
-            value=2021038624, step=1,
+            '開始 ID',value=2021038624, step=1,
         )
     with col2:
         count = st.number_input('取得件数（ID 連番）', min_value=1, max_value=200, value=12)
