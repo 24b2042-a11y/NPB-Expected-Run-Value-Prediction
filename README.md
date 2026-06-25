@@ -1,88 +1,73 @@
 # NPB 得点期待値予測アプリ
 
-PBP（打席イベント）データから計算した **RE24 行列** と打者 **wOBA** を組み合わせて、
-場面（アウト × ランナー状態）ごとの期待得点を可視化するアプリです。
-
----
-
 ## ディレクトリ構成
 
 ```
 .
-├── app.py                        # Streamlit アプリ本体
-├── core.py                       # 計算ロジック（RE24・wOBA）
+├── app.py                         # Streamlit アプリ本体
+├── core.py                        # RE24・wOBA 計算ロジック
+├── scraper.py                     # スポナビ PBP スクレイパー
+├── github_sync.py                 # GitHub 自動コミット
 ├── requirements.txt
+├── .streamlit/
+│   └── secrets.toml.example       # Secrets テンプレート（push しない）
 └── data/
-    ├── all_batters_situational.csv   # 打者状況別データ
-    ├── 2021038624_広島東洋カープvs.中日ドラゴンズ_details.csv
-    ├── 2021038625_...._details.csv
-    └── ...  ← Google Drive からエクスポートした _details.csv をすべて置く
+    ├── all_batters_situational.csv
+    └── gamedata/                  # PBP データ（アプリから自動追加）
+        └── *_details.csv
 ```
 
----
+## Streamlit Community Cloud へのデプロイ
 
-## データの準備
-
-Google Drive から `_details.csv` をすべてダウンロードして `data/` に配置してください。
-Colab でまとめてダウンロードする場合:
-
-```python
-import shutil, glob
-files = glob.glob('/content/drive/MyDrive/課題解決2026前期-野球/野球データ/年間試合データ/*_details.csv')
-for f in files:
-    shutil.copy(f, '/content/drive/MyDrive/baseball_app/data/')
-```
-
----
-
-## ローカルで起動する場合
+### 1. GitHub に push
 
 ```bash
-pip install -r requirements.txt
-streamlit run app.py
+git init && git add . && git commit -m "initial"
+git remote add origin https://github.com/<your-name>/baseball-re24.git
+git push -u origin main
 ```
 
----
+### 2. share.streamlit.io でデプロイ
 
-## Streamlit Community Cloud にデプロイする手順
+New app → リポジトリ選択 → Main file: `app.py` → Deploy
 
-1. このリポジトリを GitHub に push する
-   ```bash
-   git init
-   git add .
-   git commit -m "initial commit"
-   git remote add origin https://github.com/<your-name>/baseball-re24.git
-   git push -u origin main
-   ```
+### 3. Secrets を設定
 
-2. [share.streamlit.io](https://share.streamlit.io) にアクセスして GitHub アカウントでログイン
+Streamlit Cloud の **Settings > Secrets** に貼り付け：
 
-3. **New app** → リポジトリ・ブランチ・`app.py` を選択して **Deploy**
+```toml
+[github]
+token     = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+repo_name = "your-username/baseball-re24"
+branch    = "main"
+```
 
-4. 数分でアプリが公開される
+> GitHub Personal Access Token は `repo` スコープが必要です。  
+> https://github.com/settings/tokens で発行してください。
 
-> **注意**: `data/` フォルダ内の CSV も GitHub に push が必要です。  
-> ファイルサイズが大きい場合は `.gitattributes` で Git LFS を使うか、  
-> `st.file_uploader` でアップロード方式に変更してください。
+## アプリの使い方
 
----
+### 「試合データ取得・更新」タブ
 
-## 機能
+| 設定項目 | 説明 |
+|---------|------|
+| 開始 ID | スポナビの試合 ID（例: 2021038624） |
+| 取得件数 | 連番で何試合分取得するか |
+| リクエスト間隔 | サーバー負荷軽減のための待機秒数 |
 
-| 機能 | 説明 |
-|------|------|
-| RE24 ヒートマップ | 24 マスの期待得点を色付きで表示。選択中の場面を赤枠でハイライト |
-| 1 場面予測 | 打者・対戦相手・アウト・ランナーを指定して基礎 RE24 と補正後期待得点を表示 |
-| 24 場面一覧 | 指定打者×対戦相手の全組み合わせをグラフ・テーブルで表示 |
-| CSV ダウンロード | 24 場面テーブルを CSV でエクスポート |
+取得ボタンを押すと：
+1. スポナビから PBP を取得
+2. `data/` に CSV を保存し GitHub にコミット
+3. RE24 キャッシュをクリアして自動再計算
 
----
+### 「得点期待値予測」タブ
+
+- サイドバーで打者・対戦相手・アウト・ランナー状態を選択
+- RE24 ヒートマップで全 24 場面の基礎期待得点を確認
+- 選択場面の補正後期待得点をリアルタイム表示
 
 ## 補正ロジック
 
 ```
-補正後期待得点 = 基礎RE24 × (打者wOBA / リーグ平均wOBA)
+補正後期待得点 = 基礎 RE24 × (打者 wOBA / リーグ平均 wOBA)
 ```
-
-- 打者の wOBA は `all_batters_situational.csv` の対戦相手別成績から計算
-- 対戦打席数 < 10 の場合はリーグ平均 wOBA で代替
