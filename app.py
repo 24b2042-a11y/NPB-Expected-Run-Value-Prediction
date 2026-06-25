@@ -127,7 +127,7 @@ def tab_scraper():
             '```'
         )
 
-    st.subheader('取得範囲の設定')
+    st.subheader('取得範囲の設定(2026年の試合データは2021038624から)')
     col1, col2, col3 = st.columns(3)
     with col1:
         start_id = st.number_input(
