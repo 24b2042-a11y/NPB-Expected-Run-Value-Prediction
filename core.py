@@ -184,7 +184,6 @@ def predict_all(re24, df_woba, league_avg,
 # ============================================================
 def build_model(details_dir: str, batter_csv: str):
     # データなし → RE24はNaN埋めで返し、予測タブ側で案内する
-    os.makedirs(details_dir, exist_ok=True)
     files = glob.glob(os.path.join(details_dir, '*_details.csv'))
     if files:
         all_df, n_games = load_all_details(details_dir)
