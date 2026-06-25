@@ -127,18 +127,16 @@ def tab_scraper():
             '```'
         )
 
-    st.subheader('取得範囲の設定(2026年の試合データは2021038624から)')
-    col1, col2, col3 = st.columns(3)
+    START_ID = 2021038624
+
+    st.subheader('取得範囲の設定')
+    col1, col2 = st.columns(2)
     with col1:
-        start_id = st.number_input(
-            '開始 ID',value=2021038624
-        )
+        count = st.number_input('取得件数（ID 連番）', min_value=1, max_value=900, value=500)
     with col2:
-        count = st.number_input('取得件数（ID 連番）', min_value=1, max_value=200, value=12)
-    with col3:
         sleep_sec = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 2.0, 0.5)
 
-    st.caption(f'対象 ID: **{start_id}** 〜 **{start_id + count - 1}**（{count} 件）')
+    st.caption(f'対象 ID: **{START_ID}** 〜 **{START_ID + count - 1}**（{count} 件）')
 
     if st.button('▶ 取得開始', type='primary', disabled=(not gh_cfg)):
 
@@ -151,7 +149,7 @@ def tab_scraper():
 
         # ---- スクレイプ ----
         for i, result in enumerate(
-            scrape_games(start_id, count, sleep_sec=sleep_sec)
+            scrape_games(START_ID, count, sleep_sec=sleep_sec)
         ):
             pct  = (i + 1) / count
             gid  = result['game_id']
