@@ -132,7 +132,7 @@ def tab_scraper():
     st.subheader('取得範囲の設定')
     col1, col2 = st.columns(2)
     with col1:
-        count = st.number_input('取得件数（ID 連番）', min_value=1, max_value=900, value=500)
+        count = st.number_input('取得件数（ID 連番）', min_value=1, max_value=200, value=12)
     with col2:
         sleep_sec = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 2.0, 0.5)
 
@@ -329,10 +329,9 @@ def main():
         tab_scraper()
 
     with tab2:
-        try:
-            re24, counts, df_woba, league_avg, n_games, n_pa = load_model()
-        except FileNotFoundError as e:
-            st.error(f'データが見つかりません。先に「試合データ取得」タブで取得してください。\n\n{e}')
+        re24, counts, df_woba, league_avg, n_games, n_pa = load_model()
+        if n_games == 0:
+            st.info('まだ試合データがありません。「📥 試合データ取得・更新」タブからデータを取得してください。')
             st.stop()
         tab_predict(re24, counts, df_woba, league_avg, n_games, n_pa)
 
