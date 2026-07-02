@@ -128,8 +128,6 @@ def tab_scraper(gh_cfg):
     with col2:
         sleep_sec = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 2.0, 0.5)
 
-    st.caption(f'対象 ID: **{START_ID}** 〜 **{START_ID + count - 1}**（{count} 件）')
-
     if st.button('▶ 取得開始', type='primary'):
 
         # ---- 既存ファイルの状態を取得 ----
@@ -137,10 +135,15 @@ def tab_scraper(gh_cfg):
             complete_ids, incomplete_ids = get_existing_game_ids(
                 gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
             )
+
+        # 取得済み最大IDの次から開始、なければデフォルトIDから
+        all_existing = complete_ids | incomplete_ids
+        scrape_start = max(all_existing) + 1 if all_existing else START_ID
+
         st.info(
-            f'既存: 完全 **{len(complete_ids)}** 件 / '
-            f'不完全 **{len(incomplete_ids)}** 件  '
-            f'→ 完全取得済みはスキップします'
+            f'既存: 完全 **{len(complete_ids)}** 件 / 不完全 **{len(incomplete_ids)}** 件  \n'
+            f'新規取得開始ID: **{scrape_start}** 〜 **{scrape_start + count - 1}**'
+            + (f'  /  不完全データ **{len(incomplete_ids)}** 件を再取得' if incomplete_ids else '')
         )
 
         progress_bar  = st.progress(0, text='準備中...')
@@ -150,22 +153,35 @@ def tab_scraper(gh_cfg):
         collected: list[dict] = []
         ok, skip, err = 0, 0, 0
 
-        for i, result in enumerate(scrape_games(START_ID, count, sleep_sec=sleep_sec)):
+        # ---- 不完全データの再取得 ----
+        retry_ids = sorted(incomplete_ids)
+        for gid in retry_ids:
+            for result in scrape_games(gid, 1, sleep_sec=sleep_sec):
+                card = result['card'] or '---'
+                if result['status'] == 'ok':
+                    fname = f"{gid}_{card}_details.csv"
+                    collected.append({'filename': fname, 'df': result['df_details']})
+                    if result['df_score'] is not None:
+                        collected.append({
+                            'filename': f"{gid}_{card}_score.csv",
+                            'df': result['df_score'],
+                        })
+                    ok += 1
+                    with log_container:
+                        st.text(f'🔄 {gid}  {card}  不完全データを再取得')
+                else:
+                    err += 1
+                    with log_container:
+                        st.text(f'⚠️ {gid}  {card}  {result["message"]}')
+
+        # ---- 新規IDのスクレイプ ----
+        for i, result in enumerate(scrape_games(scrape_start, count, sleep_sec=sleep_sec)):
             pct  = (i + 1) / count
             gid  = result['game_id']
             card = result['card'] or '---'
 
-            # 完全取得済みはスキップ
-            if gid in complete_ids:
-                skip += 1
-                progress_bar.progress(pct, text=f'[{i+1}/{count}] {gid} スキップ')
-                with log_container:
-                    st.text(f'⏭ {gid}  {card}  取得済みのためスキップ')
-                continue
-
             if result['status'] == 'ok':
-                action = '🔄 再取得' if gid in incomplete_ids else '✅ 新規'
-                fname  = f"{gid}_{card}_details.csv"
+                fname = f"{gid}_{card}_details.csv"
                 collected.append({'filename': fname, 'df': result['df_details']})
                 if result['df_score'] is not None:
                     collected.append({
@@ -173,7 +189,7 @@ def tab_scraper(gh_cfg):
                         'df': result['df_score'],
                     })
                 ok += 1
-                icon = action
+                icon = '✅'
             elif result['status'] == 'no_game':
                 skip += 1
                 icon = '⬜'
