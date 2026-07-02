@@ -319,4 +319,142 @@ def page_settings(gh_cfg):
 
         # 不完全データの再取得
         for gid in sorted(incomplete_ids):
-            for result in scrape_games(gid, 1, sleep_sec=sleep
+            for result in scrape_games(gid, 1, sleep_sec=sleep_sec):
+                card = result['card'] or '---'
+                if result['status'] == 'ok':
+                    collected.append({'filename': f"{gid}_{card}_details.csv",
+                                      'df': result['df_details']})
+                    if result['df_score'] is not None:
+                        collected.append({'filename': f"{gid}_{card}_score.csv",
+                                          'df': result['df_score']})
+                    ok += 1
+                    with log_container:
+                        st.text(f'🔄 {gid}  {card}  不完全データを再取得')
+                else:
+                    err += 1
+                    with log_container:
+                        st.text(f'⚠️ {gid}  {card}  {result["message"]}')
+
+        # 新規IDのスクレイプ
+        for i, result in enumerate(scrape_games(scrape_start, count, sleep_sec=sleep_sec)):
+            pct  = (i + 1) / count
+            gid  = result['game_id']
+            card = result['card'] or '---'
+            if result['status'] == 'ok':
+                collected.append({'filename': f"{gid}_{card}_details.csv",
+                                  'df': result['df_details']})
+                if result['df_score'] is not None:
+                    collected.append({'filename': f"{gid}_{card}_score.csv",
+                                      'df': result['df_score']})
+                ok += 1
+                icon = '✅'
+            elif result['status'] == 'no_game':
+                skip += 1
+                icon = '⬜'
+            else:
+                err += 1
+                icon = '⚠️'
+            progress_bar.progress(pct, text=f'[{i+1}/{count}] {gid} {card}')
+            with log_container:
+                st.text(f'{icon} {gid}  {card}  {result["message"]}')
+
+        status_area.success(
+            f'スクレイプ完了 — 取得: {ok} 件 / スキップ: {skip} 件 / エラー: {err} 件'
+        )
+
+        if not collected:
+            st.info('新規・更新対象のデータがありませんでした。')
+            return
+
+        st.subheader('GitHub へ保存中...')
+        commit_bar = st.progress(0, text='コミット準備中...')
+        commit_log = st.container()
+
+        def on_progress(i, total, fname, success, msg):
+            commit_bar.progress(i / total, text=f'[{i}/{total}] {fname}')
+            with commit_log:
+                st.text(f'{"✅" if success else "❌"} {msg}')
+
+        ok_cnt, fail_cnt = commit_game_files(
+            token=gh_cfg['token'], repo_name=gh_cfg['repo_name'],
+            files=collected, branch=gh_cfg['branch'], on_progress=on_progress,
+        )
+
+        if fail_cnt == 0:
+            st.success(f'✅ {ok_cnt} ファイルを GitHub にコミットしました。')
+        else:
+            st.warning(f'{ok_cnt} 件成功 / {fail_cnt} 件失敗')
+
+        st.info('データキャッシュをクリアして再計算します...')
+        reload_model()
+
+    st.divider()
+    st.subheader('📁 データソース')
+    st.markdown(
+        f'- 打席イベント: GitHub `data/gamedata/*_details.csv`\n'
+        f'- 状況別打者成績: `data/all_batters_situational.csv`\n'
+        f'- 過去3年成績: `data/2023~2025打撃データ/stats_YYYY.csv`'
+    )
+
+
+# ============================================================
+# メイン
+# ============================================================
+def main():
+    gh_cfg = get_github_cfg()
+
+    # 1. 起動時の初期ページを「メイン」に強制固定する仕組み
+    if 'current_page' not in st.session_state:
+        st.session_state['current_page'] = '🔮 メイン（予測）'
+
+    # ---- サイドバー: ナビゲーション ----
+    with st.sidebar:
+        st.markdown('## ⚾ NPB 得点期待値')
+        st.divider()
+        
+        # 2. ラジオボタンに key を割り当て、セッション状態とカチッと同期させる
+        page_options = ['🔮 メイン（予測）', '⚙️ 設定（データ更新）']
+        
+        # セッションに保存されているページが選択肢の何番目かを取得（安全対策）
+        try:
+            default_idx = page_options.index(st.session_state['current_page'])
+        except ValueError:
+            default_idx = 0
+
+        page = st.radio(
+            'メニュー',
+            page_options,
+            index=default_idx,
+            label_visibility='collapsed',
+            key='sidebar_navigation',  # 明示的なキーを設定してバグを防ぐ
+        )
+        
+        # ラジオボタンの変更をセッションに即時反映
+        st.session_state['current_page'] = page
+        
+        st.divider()
+        st.caption('PBP データから計算した RE24 × 打者 wOBA で場面ごとの期待得点を推定します。')
+
+    # ---- ページ出し分けロジック ----
+    if st.session_state['current_page'] == '🔮 メイン（予測）':
+        if not gh_cfg:
+            st.error('GitHub の認証情報が設定されていません。「⚙️ 設定（データ更新）」ページを確認してください。')
+            st.stop()
+            
+        re24, counts, df_woba, league_avg, n_games, n_pa, df_career = load_model(
+            gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
+        )
+        
+        # もしデータが0件なら、画面を完全に止めずに、メッセージを出してユーザーが「設定」に手動で切り替えられるようにする
+        if n_games == 0:
+            st.info('試合データがありません。サイドバーから「⚙️ 設定（データ更新）」を選択してデータを取得してください。')
+            st.stop()
+            
+        page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career)
+
+    elif st.session_state['current_page'] == '⚙️ 設定（データ更新）':
+        page_settings(gh_cfg)
+
+
+if __name__ == '__main__':
+    main()
