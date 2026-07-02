@@ -410,6 +410,7 @@ def main():
         page = st.radio(
             'メニュー',
             ['🔮 メイン（予測）', '⚙️ 設定（データ更新）'],
+            index=0,
             label_visibility='collapsed',
         )
         st.divider()
