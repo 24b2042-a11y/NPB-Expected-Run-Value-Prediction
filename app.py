@@ -132,13 +132,12 @@ def tab_scraper(gh_cfg):
 
         # ---- 既存ファイルの状態を取得 ----
         with st.spinner('GitHub の既存データを確認中...'):
-            complete_ids, incomplete_ids = get_existing_game_ids(
+            complete_ids, incomplete_ids, latest_id = get_existing_game_ids(
                 gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
             )
 
-        # 取得済み最大IDの次から開始、なければデフォルトIDから
-        all_existing = complete_ids | incomplete_ids
-        scrape_start = max(all_existing) + 1 if all_existing else START_ID
+        # ファイル一覧末尾のIDの次から開始、なければデフォルトIDから
+        scrape_start = latest_id + 1 if latest_id is not None else START_ID
 
         st.info(
             f'既存: 完全 **{len(complete_ids)}** 件 / 不完全 **{len(incomplete_ids)}** 件  \n'
