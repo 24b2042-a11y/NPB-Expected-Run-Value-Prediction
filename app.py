@@ -132,7 +132,7 @@ def tab_scraper():
     st.subheader('取得範囲の設定')
     col1, col2 = st.columns(2)
     with col1:
-        count = st.number_input('取得件数（ID 連番）', min_value=1, max_value=200, value=12)
+        count = st.number_input('取得件数（ID 連番）', min_value=1, max_value=900, value=200)
     with col2:
         sleep_sec = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 2.0, 0.5)
 
