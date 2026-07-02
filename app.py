@@ -12,26 +12,25 @@ from core import (
     RUNNER_LABEL, RUNNER_MAP,
 )
 from scraper import scrape_games
-from github_sync import commit_game_files, load_details_from_github
-
-# ============================================================
-# ページ設定
-# ============================================================
-st.set_page_config(
-    page_title='NPB 得点期待値予測',
-    page_icon='⚾',
-    layout='wide',
+from github_sync import (
+    commit_game_files,
+    load_details_from_github,
+    get_existing_game_ids,
 )
+
+st.set_page_config(page_title='NPB 得点期待値予測', page_icon='⚾', layout='wide')
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 BATTER_CSV = os.path.join(BASE_DIR, 'data', 'all_batters_situational.csv')
+START_ID   = 2021038624
+
 
 # ============================================================
 # モデルのキャッシュ読み込み（GitHub API 経由）
 # ============================================================
 @st.cache_data(show_spinner='RE24 を計算しています...')
 def load_model(token: str, repo_name: str, branch: str):
-    dfs, n_files = load_details_from_github(token, repo_name, branch)
+    dfs, _ = load_details_from_github(token, repo_name, branch)
     return build_model_from_dfs(dfs, BATTER_CSV)
 
 
@@ -89,10 +88,10 @@ def plot_re24_heatmap(re24, highlight_out=None, highlight_runner=None):
 
 
 def plot_24_bar(df_all, batter_name, opponent):
-    df = df_all.copy()
+    df   = df_all.copy()
     df['場面'] = df['アウト'].astype(str) + 'out / ' + df['ランナー']
     df_p = df[df['補正後期待得点'].notna()]
-    fig = px.bar(
+    fig  = px.bar(
         df_p, x='場面', y='補正後期待得点', color='アウト',
         color_continuous_scale='Blues',
         text=df_p['補正後期待得点'].round(3),
@@ -117,16 +116,10 @@ def tab_scraper(gh_cfg):
         st.warning(
             'GitHub の認証情報が設定されていません。\n\n'
             'Streamlit Community Cloud の **Settings > Secrets** に以下を追加してください：\n\n'
-            '```toml\n'
-            '[github]\n'
-            'token     = "ghp_..."\n'
-            'repo_name = "your-name/baseball-re24"\n'
-            'branch    = "main"\n'
-            '```'
+            '```toml\n[github]\ntoken     = "ghp_..."\n'
+            'repo_name = "your-name/baseball-re24"\nbranch    = "main"\n```'
         )
         return
-
-    START_ID = 2021038624
 
     st.subheader('取得範囲の設定')
     col1, col2 = st.columns(2)
@@ -138,6 +131,17 @@ def tab_scraper(gh_cfg):
     st.caption(f'対象 ID: **{START_ID}** 〜 **{START_ID + count - 1}**（{count} 件）')
 
     if st.button('▶ 取得開始', type='primary'):
+
+        # ---- 既存ファイルの状態を取得 ----
+        with st.spinner('GitHub の既存データを確認中...'):
+            complete_ids, incomplete_ids = get_existing_game_ids(
+                gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
+            )
+        st.info(
+            f'既存: 完全 **{len(complete_ids)}** 件 / '
+            f'不完全 **{len(incomplete_ids)}** 件  '
+            f'→ 完全取得済みはスキップします'
+        )
 
         progress_bar  = st.progress(0, text='準備中...')
         status_area   = st.empty()
@@ -151,8 +155,17 @@ def tab_scraper(gh_cfg):
             gid  = result['game_id']
             card = result['card'] or '---'
 
+            # 完全取得済みはスキップ
+            if gid in complete_ids:
+                skip += 1
+                progress_bar.progress(pct, text=f'[{i+1}/{count}] {gid} スキップ')
+                with log_container:
+                    st.text(f'⏭ {gid}  {card}  取得済みのためスキップ')
+                continue
+
             if result['status'] == 'ok':
-                fname = f"{gid}_{card}_details.csv"
+                action = '🔄 再取得' if gid in incomplete_ids else '✅ 新規'
+                fname  = f"{gid}_{card}_details.csv"
                 collected.append({'filename': fname, 'df': result['df_details']})
                 if result['df_score'] is not None:
                     collected.append({
@@ -160,7 +173,7 @@ def tab_scraper(gh_cfg):
                         'df': result['df_score'],
                     })
                 ok += 1
-                icon = '✅'
+                icon = action
             elif result['status'] == 'no_game':
                 skip += 1
                 icon = '⬜'
@@ -177,9 +190,10 @@ def tab_scraper(gh_cfg):
         )
 
         if not collected:
-            st.info('取得できた試合データがありませんでした。')
+            st.info('新規・更新対象のデータがありませんでした。')
             return
 
+        # ---- GitHub コミット ----
         st.subheader('GitHub へ保存中...')
         commit_bar = st.progress(0, text='コミット準備中...')
         commit_log = st.container()
@@ -313,7 +327,6 @@ def main():
     st.caption('PBP データから計算した RE24 × 打者 wOBA で場面ごとの期待得点を推定します。')
 
     gh_cfg = get_github_cfg()
-
     tab1, tab2 = st.tabs(['📥 試合データ取得・更新', '🔮 得点期待値予測'])
 
     with tab1:
