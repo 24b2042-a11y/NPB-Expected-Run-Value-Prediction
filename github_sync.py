@@ -117,32 +117,31 @@ def get_existing_game_ids(
     token: str,
     repo_name: str,
     branch: str = 'main',
-) -> tuple[set[int], set[int]]:
+) -> tuple[set[int], set[int], int | None]:
     """
     data/gamedata/ 内の _details.csv を調べて以下を返す。
+    GitHub API はファイル名順で返すため、末尾のファイルが最新の game_id。
 
     Returns
     -------
     complete_ids   : 試合終了まで取得済みの game_id セット
     incomplete_ids : ファイルはあるが不完全（試合終了なし or 打席数<10）の game_id セット
-
-    スクレイプ時の使い方:
-        - complete_ids   に含まれる → スキップ
-        - incomplete_ids に含まれる → 再取得して上書き
-        - どちらにもない           → 新規取得
+    latest_id      : ファイル一覧末尾の game_id（新規取得の開始点算出に使用）
     """
     repo           = get_repo(token, repo_name)
     complete_ids   = set()
     incomplete_ids = set()
+    latest_id      = None
 
     try:
         contents = repo.get_contents('data/gamedata', ref=branch)
     except GithubException:
-        return set(), set()
+        return set(), set(), None
 
-    for item in contents:
-        if not item.name.endswith('_details.csv'):
-            continue
+    # ファイル名順（= game_id昇順）で並んでいるため末尾が最新
+    detail_items = [c for c in contents if c.name.endswith('_details.csv')]
+
+    for item in detail_items:
         try:
             game_id = int(item.name.split('_', 1)[0])
             raw     = item.decoded_content
@@ -155,7 +154,13 @@ def get_existing_game_ids(
         except Exception:
             continue
 
-    return complete_ids, incomplete_ids
+    if detail_items:
+        try:
+            latest_id = int(detail_items[-1].name.split('_', 1)[0])
+        except Exception:
+            pass
+
+    return complete_ids, incomplete_ids, latest_id
 
 
 def _is_complete(df: pd.DataFrame) -> bool:
