@@ -8,11 +8,11 @@ import os
 import plotly.graph_objects as go
 import plotly.express as px
 from core import (
-    build_model, predict_one, predict_all,
+    build_model_from_dfs, predict_one, predict_all,
     RUNNER_LABEL, RUNNER_MAP,
 )
 from scraper import scrape_games
-from github_sync import commit_game_files
+from github_sync import commit_game_files, load_details_from_github
 
 # ============================================================
 # ページ設定
@@ -23,20 +23,19 @@ st.set_page_config(
     layout='wide',
 )
 
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-DETAILS_DIR = os.path.join(BASE_DIR, 'data', 'gamedata')
-BATTER_CSV  = os.path.join(BASE_DIR, 'data', 'all_batters_situational.csv')
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+BATTER_CSV = os.path.join(BASE_DIR, 'data', 'all_batters_situational.csv')
 
 # ============================================================
-# モデルのキャッシュ読み込み
+# モデルのキャッシュ読み込み（GitHub API 経由）
 # ============================================================
 @st.cache_data(show_spinner='RE24 を計算しています...')
-def load_model():
-    return build_model(DETAILS_DIR, BATTER_CSV)
+def load_model(token: str, repo_name: str, branch: str):
+    dfs, n_files = load_details_from_github(token, repo_name, branch)
+    return build_model_from_dfs(dfs, BATTER_CSV)
 
 
 def reload_model():
-    """取得後にキャッシュをクリアして再計算"""
     load_model.clear()
     st.rerun()
 
@@ -111,10 +110,9 @@ def plot_24_bar(df_all, batter_name, opponent):
 # ============================================================
 # タブ: 試合データ取得
 # ============================================================
-def tab_scraper():
+def tab_scraper(gh_cfg):
     st.header('📥 試合データ取得')
 
-    gh_cfg = get_github_cfg()
     if not gh_cfg:
         st.warning(
             'GitHub の認証情報が設定されていません。\n\n'
@@ -126,6 +124,7 @@ def tab_scraper():
             'branch    = "main"\n'
             '```'
         )
+        return
 
     START_ID = 2021038624
 
@@ -138,19 +137,16 @@ def tab_scraper():
 
     st.caption(f'対象 ID: **{START_ID}** 〜 **{START_ID + count - 1}**（{count} 件）')
 
-    if st.button('▶ 取得開始', type='primary', disabled=(not gh_cfg)):
+    if st.button('▶ 取得開始', type='primary'):
 
         progress_bar  = st.progress(0, text='準備中...')
         status_area   = st.empty()
         log_container = st.container()
 
-        collected: list[dict] = []   # {'filename': str, 'df': DataFrame}
+        collected: list[dict] = []
         ok, skip, err = 0, 0, 0
 
-        # ---- スクレイプ ----
-        for i, result in enumerate(
-            scrape_games(START_ID, count, sleep_sec=sleep_sec)
-        ):
+        for i, result in enumerate(scrape_games(START_ID, count, sleep_sec=sleep_sec)):
             pct  = (i + 1) / count
             gid  = result['game_id']
             card = result['card'] or '---'
@@ -184,7 +180,6 @@ def tab_scraper():
             st.info('取得できた試合データがありませんでした。')
             return
 
-        # ---- GitHub コミット ----
         st.subheader('GitHub へ保存中...')
         commit_bar = st.progress(0, text='コミット準備中...')
         commit_log = st.container()
@@ -192,14 +187,13 @@ def tab_scraper():
         def on_progress(i, total, fname, success, msg):
             commit_bar.progress(i / total, text=f'[{i}/{total}] {fname}')
             with commit_log:
-                icon = '✅' if success else '❌'
-                st.text(f'{icon} {msg}')
+                st.text(f'{"✅" if success else "❌"} {msg}')
 
         ok_cnt, fail_cnt = commit_game_files(
-            token     = gh_cfg['token'],
-            repo_name = gh_cfg['repo_name'],
-            files     = collected,
-            branch    = gh_cfg['branch'],
+            token       = gh_cfg['token'],
+            repo_name   = gh_cfg['repo_name'],
+            files       = collected,
+            branch      = gh_cfg['branch'],
             on_progress = on_progress,
         )
 
@@ -208,7 +202,6 @@ def tab_scraper():
         else:
             st.warning(f'{ok_cnt} 件成功 / {fail_cnt} 件失敗')
 
-        # ---- RE24 再計算 ----
         st.info('RE24 キャッシュをクリアして再計算します...')
         reload_model()
 
@@ -219,15 +212,14 @@ def tab_scraper():
 def tab_predict(re24, counts, df_woba, league_avg, n_games, n_pa):
     st.header('🔮 得点期待値予測')
 
-    # サイドバー入力
     st.sidebar.header('🎯 場面設定')
-    batters    = sorted(df_woba['選手名'].unique().tolist())
-    batter     = st.sidebar.selectbox('打者', batters)
-    opponents  = sorted(df_woba['区分名'].unique().tolist())
-    opponent   = st.sidebar.selectbox('対戦相手', opponents)
-    out        = st.sidebar.radio('アウトカウント', [0, 1, 2],
-                                   format_func=lambda x: f'{x} アウト',
-                                   horizontal=True)
+    batters   = sorted(df_woba['選手名'].unique().tolist())
+    batter    = st.sidebar.selectbox('打者', batters)
+    opponents = sorted(df_woba['区分名'].unique().tolist())
+    opponent  = st.sidebar.selectbox('対戦相手', opponents)
+    out       = st.sidebar.radio('アウトカウント', [0, 1, 2],
+                                  format_func=lambda x: f'{x} アウト',
+                                  horizontal=True)
 
     st.sidebar.markdown('**ランナー状態**')
     c1, c2, c3 = st.sidebar.columns(3)
@@ -248,7 +240,6 @@ def tab_predict(re24, counts, df_woba, league_avg, n_games, n_pa):
     runner = runner_map[(r1, r2, r3)]
     st.sidebar.markdown(f'選択中: **{runner}**')
 
-    # 上段
     col_info, col_pred = st.columns(2)
 
     with col_info:
@@ -271,8 +262,8 @@ def tab_predict(re24, counts, df_woba, league_avg, n_games, n_pa):
         if res['note']:
             st.warning(res['note'])
         p1, p2, p3 = st.columns(3)
-        p1.metric('基礎 RE24',     str(res['基礎RE24'] or 'N/A'))
-        p2.metric('打者 wOBA',     str(res['打者wOBA']))
+        p1.metric('基礎 RE24',      str(res['基礎RE24'] or 'N/A'))
+        p2.metric('打者 wOBA',      str(res['打者wOBA']))
         delta_str = ''
         if res['補正後期待得点'] and res['基礎RE24']:
             delta_str = str(round(res['補正後期待得点'] - res['基礎RE24'], 3))
@@ -281,12 +272,10 @@ def tab_predict(re24, counts, df_woba, league_avg, n_games, n_pa):
 
     st.divider()
 
-    # RE24 ヒートマップ
     st.subheader('🗺 RE24 行列')
     hl_runner = runner if runner != '走者なし' else ''
     st.plotly_chart(plot_re24_heatmap(re24, out, hl_runner), use_container_width=True)
 
-    # 24場面
     st.subheader(f'📋 {batter} vs {opponent} — 全 24 場面')
     df_all = predict_all(re24, df_woba, league_avg, batter, opponent)
 
@@ -323,13 +312,20 @@ def main():
     st.title('⚾ NPB 得点期待値予測')
     st.caption('PBP データから計算した RE24 × 打者 wOBA で場面ごとの期待得点を推定します。')
 
+    gh_cfg = get_github_cfg()
+
     tab1, tab2 = st.tabs(['📥 試合データ取得・更新', '🔮 得点期待値予測'])
 
     with tab1:
-        tab_scraper()
+        tab_scraper(gh_cfg)
 
     with tab2:
-        re24, counts, df_woba, league_avg, n_games, n_pa = load_model()
+        if not gh_cfg:
+            st.error('GitHub の認証情報が設定されていません。')
+            st.stop()
+        re24, counts, df_woba, league_avg, n_games, n_pa = load_model(
+            gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
+        )
         if n_games == 0:
             st.info('まだ試合データがありません。「📥 試合データ取得・更新」タブからデータを取得してください。')
             st.stop()
