@@ -160,11 +160,66 @@ def predict_all(re24, df_woba, league_avg,
 
 
 # ============================================================
+# Step 7: 選手個人の過去成績（stats_YYYY.csv）を読み込む
+# ============================================================
+def load_career_stats(stats_dir: str) -> pd.DataFrame:
+    """
+    data/2023~2025打撃データ/ 内の stats_2023.csv, stats_2024.csv, stats_2025.csv
+    を全件結合して返す。ファイルが存在しない年はスキップする。
+
+    列: player_id, 選手名, 年度, 試合, 打席, 打数, 得点, 安打, 二塁打, 三塁打,
+        本塁打, 塁打, 打点, 盗塁, 盗塁刺, 四球, 死球, 三振, 併殺打,
+        打率, 出塁率, 長打率, 犠打, 犠飛, 所属球団
+    """
+    files = sorted(glob.glob(os.path.join(stats_dir, 'stats_*.csv')))
+    if not files:
+        return pd.DataFrame()
+
+    dfs = []
+    for f in files:
+        try:
+            df = pd.read_csv(f, encoding='utf-8-sig')
+            dfs.append(df)
+        except Exception:
+            continue
+
+    if not dfs:
+        return pd.DataFrame()
+
+    all_stats = pd.concat(dfs, ignore_index=True)
+    all_stats['選手名_key'] = all_stats['選手名'].str.replace(r'[\s　]', '', regex=True)
+    all_stats['OPS'] = all_stats['出塁率'] + all_stats['長打率']
+    return all_stats
+
+
+def get_player_career(df_stats: pd.DataFrame, batter_name: str) -> pd.DataFrame:
+    """
+    指定選手の過去成績を年度昇順で返す。
+    """
+    if df_stats.empty:
+        return pd.DataFrame()
+    key = re.sub(r'[\s　]', '', batter_name)
+    result = df_stats[df_stats['選手名_key'] == key].sort_values('年度')
+    return result
+
+
+def get_player_current_team(df_stats: pd.DataFrame, batter_name: str) -> str | None:
+    """
+    最新年度の所属球団を返す。データがなければ None。
+    """
+    career = get_player_career(df_stats, batter_name)
+    if career.empty:
+        return None
+    return career.iloc[-1]['所属球団']
+
+
+# ============================================================
 # モデル一括構築（DataFrame リストから）
 # ============================================================
-def build_model_from_dfs(dfs: list[pd.DataFrame], batter_csv: str):
+def build_model_from_dfs(dfs: list[pd.DataFrame], batter_csv: str, stats_dir: str | None = None):
     """
     dfs: GitHub から読み込んだ _details.csv の DataFrame リスト
+    stats_dir: 過去3年成績 CSV が入っているディレクトリ（任意）
     """
     if dfs:
         all_df   = concat_details(dfs)
@@ -181,4 +236,6 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_csv: str):
         n_pa   = 0
 
     df_woba, league_avg = build_batter_woba(batter_csv)
-    return re24, counts, df_woba, league_avg, len(dfs), n_pa
+    df_career = load_career_stats(stats_dir) if stats_dir else pd.DataFrame()
+
+    return re24, counts, df_woba, league_avg, len(dfs), n_pa, df_career
