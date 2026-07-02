@@ -1,14 +1,10 @@
 """
 core.py — RE24 計算・予測ロジック（Streamlit / Colab 共通）
-Google Drive / Colab 依存を完全に除去
 """
 import os, re, glob
 import numpy as np
 import pandas as pd
 
-# ============================================================
-# 定数
-# ============================================================
 RUNNER_MAP = {
     '':       0, '走者なし': 0,
     '1塁':    1, '2塁':    2, '3塁':    3,
@@ -16,32 +12,20 @@ RUNNER_MAP = {
     '満塁':   7,
 }
 RUNNER_LABEL = ['走者なし', '1塁', '2塁', '3塁', '1,2塁', '1,3塁', '2,3塁', '満塁']
-
-WOBA_W = dict(BB=0.70, HBP=0.73, S=0.89, D=1.27, T=1.61, HR=2.10)
-
-RE_SCORE = re.compile(r'\S+\s+(\d+)-(\d+)\s+\S+')
+WOBA_W       = dict(BB=0.70, HBP=0.73, S=0.89, D=1.27, T=1.61, HR=2.10)
+RE_SCORE     = re.compile(r'\S+\s+(\d+)-(\d+)\s+\S+')
 
 
 # ============================================================
-# Step 1: _details.csv を全試合分読み込む
+# Step 1: DataFrame リストを結合して型を整える
 # ============================================================
-def load_all_details(details_dir: str) -> pd.DataFrame:
-    files = glob.glob(os.path.join(details_dir, '*_details.csv'))
-    if not files:
-        raise FileNotFoundError(f"_details.csv が見つかりません: {details_dir}")
-    dfs = []
-    for f in files:
-        df = pd.read_csv(f, encoding='utf-8-sig')
-        base   = os.path.basename(f)
-        parts  = base.split('_', 1)
-        df['game_id'] = parts[0]
-        dfs.append(df)
+def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     all_df = pd.concat(dfs, ignore_index=True)
     all_df['アウト']   = pd.to_numeric(all_df['アウト'],   errors='coerce').fillna(0).astype(int)
     all_df['打席順']  = pd.to_numeric(all_df['打席順'],  errors='coerce').fillna(0).astype(int)
     all_df['打順']    = pd.to_numeric(all_df['打順'],    errors='coerce')
     all_df['ランナー'] = all_df['ランナー'].fillna('')
-    return all_df, len(files)
+    return all_df
 
 
 # ============================================================
@@ -130,7 +114,7 @@ def build_batter_woba(batter_csv: str):
 
 
 # ============================================================
-# Step 5: 1場面の期待得点を予測
+# Step 5: 1場面の予測
 # ============================================================
 def predict_one(re24, df_woba, league_avg,
                 batter_name: str, opponent: str,
@@ -138,22 +122,20 @@ def predict_one(re24, df_woba, league_avg,
     runner_idx = RUNNER_MAP.get(runner, 0)
     base_re    = re24.iloc[out, runner_idx]
 
-    key = re.sub(r'[\s\u3000]', '', batter_name)
+    key = re.sub(r'[\s　]', '', batter_name)
     hit = df_woba[(df_woba['選手名_key'] == key) & (df_woba['区分名'] == opponent)]
 
     if len(hit) > 0 and not pd.isna(hit['wOBA'].values[0]):
         batter_woba = float(hit['wOBA'].values[0])
         pa          = int(hit['打席'].values[0])
-        data_note   = ''
+        note        = ''
     else:
         batter_woba = league_avg
         pa          = 0
-        data_note   = f'※ {batter_name} vs {opponent} のデータなし → リーグ平均を使用'
+        note        = f'※ {batter_name} vs {opponent} のデータなし → リーグ平均を使用'
 
-    if not np.isnan(base_re) and league_avg > 0:
-        adj_re = base_re * (batter_woba / league_avg)
-    else:
-        adj_re = np.nan
+    adj_re = (base_re * (batter_woba / league_avg)
+              if not np.isnan(base_re) and league_avg > 0 else np.nan)
 
     return {
         'アウト':         out,
@@ -162,7 +144,7 @@ def predict_one(re24, df_woba, league_avg,
         '対戦打席数':     pa,
         '基礎RE24':       round(float(base_re), 3) if not np.isnan(base_re) else None,
         '補正後期待得点': round(float(adj_re),  3) if not np.isnan(adj_re)  else None,
-        'note':           data_note,
+        'note':           note,
     }
 
 
@@ -171,34 +153,32 @@ def predict_one(re24, df_woba, league_avg,
 # ============================================================
 def predict_all(re24, df_woba, league_avg,
                 batter_name: str, opponent: str) -> pd.DataFrame:
-    rows = []
-    for o in range(3):
-        for r in RUNNER_LABEL:
-            rows.append(predict_one(re24, df_woba, league_avg,
-                                    batter_name, opponent, o, r))
-    return pd.DataFrame(rows)
+    return pd.DataFrame([
+        predict_one(re24, df_woba, league_avg, batter_name, opponent, o, r)
+        for o in range(3) for r in RUNNER_LABEL
+    ])
 
 
 # ============================================================
-# モデル一括構築（キャッシュ用）
+# モデル一括構築（DataFrame リストから）
 # ============================================================
-def build_model(details_dir: str, batter_csv: str):
-    # データなし → RE24はNaN埋めで返し、予測タブ側で案内する
-    files = glob.glob(os.path.join(details_dir, '*_details.csv'))
-    if files:
-        all_df, n_games = load_all_details(details_dir)
-        df_runs         = calc_runs_after(all_df)
-        re24, counts    = build_re24(df_runs)
-        n_pa            = len(all_df)
+def build_model_from_dfs(dfs: list[pd.DataFrame], batter_csv: str):
+    """
+    dfs: GitHub から読み込んだ _details.csv の DataFrame リスト
+    """
+    if dfs:
+        all_df   = concat_details(dfs)
+        df_runs  = calc_runs_after(all_df)
+        re24, counts = build_re24(df_runs)
+        n_pa     = len(all_df)
     else:
-        re24   = pd.DataFrame(
+        re24 = pd.DataFrame(
             np.full((3, 8), np.nan),
             index=pd.Index([0, 1, 2], name='アウト'),
             columns=pd.Index(RUNNER_LABEL, name='ランナー状態'),
         )
-        counts  = np.zeros((3, 8), dtype=int)
-        n_games = 0
-        n_pa    = 0
+        counts = np.zeros((3, 8), dtype=int)
+        n_pa   = 0
 
     df_woba, league_avg = build_batter_woba(batter_csv)
-    return re24, counts, df_woba, league_avg, n_games, n_pa
+    return re24, counts, df_woba, league_avg, len(dfs), n_pa
