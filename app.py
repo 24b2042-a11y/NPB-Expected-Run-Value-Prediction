@@ -1,5 +1,9 @@
 """
 app.py — NPB 得点期待値予測アプリ
+
+構成:
+  1. メインページ … 得点期待値予測 + 選手個人成績
+  2. 設定ページ   … データ取得・更新
 """
 import streamlit as st
 import pandas as pd
@@ -9,6 +13,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from core import (
     build_model_from_dfs, predict_one, predict_all,
+    get_player_career, get_player_current_team,
     RUNNER_LABEL, RUNNER_MAP,
 )
 from scraper import scrape_games
@@ -27,6 +32,7 @@ st.set_page_config(
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 BATTER_CSV = os.path.join(BASE_DIR, 'data', 'all_batters_situational.csv')
+STATS_DIR  = os.path.join(BASE_DIR, 'data', '2023~2025打撃データ')
 START_ID   = 2021038624
 
 RUNNER_STR_MAP = {
@@ -47,7 +53,7 @@ RUNNER_STR_MAP = {
 @st.cache_data(show_spinner='データを読み込んでいます...')
 def load_model(token: str, repo_name: str, branch: str):
     dfs, _ = load_details_from_github(token, repo_name, branch)
-    return build_model_from_dfs(dfs, BATTER_CSV)
+    return build_model_from_dfs(dfs, BATTER_CSV, STATS_DIR)
 
 
 def reload_model():
@@ -117,10 +123,28 @@ def plot_24_bar(df_all, batter_name, opponent):
     return fig
 
 
+def plot_career_trend(df_career):
+    """過去成績の推移（打率・出塁率・長打率・OPS）"""
+    fig = go.Figure()
+    for col, color in [('打率', '#1f77b4'), ('出塁率', '#ff7f0e'),
+                       ('長打率', '#2ca02c'), ('OPS', '#d62728')]:
+        fig.add_trace(go.Scatter(
+            x=df_career['年度'], y=df_career[col],
+            mode='lines+markers', name=col, line=dict(color=color),
+        ))
+    fig.update_layout(
+        title='過去成績の推移', xaxis_title='年度', yaxis_title='値',
+        xaxis=dict(dtick=1), height=320,
+        margin=dict(l=20, r=20, t=40, b=20),
+        legend=dict(orientation='h', y=1.15),
+    )
+    return fig
+
+
 # ============================================================
-# ページ: 得点期待値予測（初期画面）
+# メインページ: 得点期待値予測 + 選手個人成績
 # ============================================================
-def page_predict(re24, counts, df_woba, league_avg, n_games, n_pa):
+def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career):
     st.title('⚾ 得点期待値予測')
     st.caption(f'使用データ: {n_games} 試合 / {n_pa:,} 打席  |  リーグ平均 wOBA: {league_avg:.3f}')
     st.divider()
@@ -139,6 +163,11 @@ def page_predict(re24, counts, df_woba, league_avg, n_games, n_pa):
         return
 
     batter = st.selectbox('選手を選択', candidates, key='batter_select')
+
+    # ---- 選手プロフィール（所属球団 + 過去3年成績） ----
+    team = get_player_current_team(df_career, batter)
+    if team:
+        st.markdown(f'**所属球団：{team}**')
 
     st.divider()
 
@@ -184,6 +213,11 @@ def page_predict(re24, counts, df_woba, league_avg, n_games, n_pa):
     st.subheader('🗺 RE24 行列')
     hl_runner = runner if runner != '走者なし' else ''
     st.plotly_chart(plot_re24_heatmap(re24, out, hl_runner), use_container_width=True)
+    with st.expander('各マスのサンプル数'):
+        st.dataframe(
+            pd.DataFrame(counts, index=['0アウト','1アウト','2アウト'], columns=RUNNER_LABEL),
+            use_container_width=True,
+        )
 
     st.divider()
 
@@ -208,37 +242,41 @@ def page_predict(re24, counts, df_woba, league_avg, n_games, n_pa):
             mime='text/csv',
         )
 
-    # ---- 選手の対戦相手別 wOBA ----
     st.divider()
-    st.subheader(f'{batter} の対戦相手別 wOBA')
-    df_b = (df_woba[df_woba['選手名'] == batter][['区分名','打席','wOBA']]
-            .query('打席 >= 10').sort_values('wOBA', ascending=False))
-    df_b['wOBA'] = df_b['wOBA'].round(3)
-    df_b.columns = ['対戦相手','打席数','wOBA']
-    st.dataframe(df_b, use_container_width=True)
+
+    # ---- 選手個人成績 ----
+    st.subheader(f'👤 {batter} の個人成績')
+
+    tab_recent, tab_career = st.tabs(['今シーズン（対戦相手別）', '過去3年成績'])
+
+    with tab_recent:
+        df_b = (df_woba[df_woba['選手名'] == batter][['区分名','打席','wOBA']]
+                .query('打席 >= 10').sort_values('wOBA', ascending=False))
+        df_b['wOBA'] = df_b['wOBA'].round(3)
+        df_b.columns = ['対戦相手','打席数','wOBA']
+        if df_b.empty:
+            st.caption('対戦相手別データ（打席10以上）がありません。')
+        else:
+            st.dataframe(df_b, use_container_width=True)
+
+    with tab_career:
+        career = get_player_career(df_career, batter)
+        if career.empty:
+            st.caption('過去成績データが見つかりません。')
+        else:
+            df_show = career[['年度','所属球団','試合','打席','打率','出塁率','長打率','OPS',
+                              '本塁打','打点','盗塁']].reset_index(drop=True)
+            st.dataframe(df_show, use_container_width=True)
+            if len(career) >= 2:
+                st.plotly_chart(plot_career_trend(career), use_container_width=True)
 
 
 # ============================================================
-# ページ: RE24 行列
+# 設定ページ: データ取得・更新
 # ============================================================
-def page_re24(re24, counts):
-    st.title('🗺 RE24 得点期待値行列')
-    st.caption('アウトカウント × ランナー状態の 24 通りの平均期待得点')
-    st.divider()
-    st.plotly_chart(plot_re24_heatmap(re24), use_container_width=True)
-    st.subheader('各マスのサンプル数')
-    st.dataframe(
-        pd.DataFrame(counts, index=['0アウト','1アウト','2アウト'],
-                     columns=RUNNER_LABEL),
-        use_container_width=True,
-    )
-
-
-# ============================================================
-# ページ: データ更新
-# ============================================================
-def page_update(gh_cfg):
-    st.title('📥 試合データ取得・更新')
+def page_settings(gh_cfg):
+    st.title('⚙️ 設定')
+    st.caption('試合データの取得・更新を行います。')
     st.divider()
 
     if not gh_cfg:
@@ -249,6 +287,8 @@ def page_update(gh_cfg):
             'repo_name = "your-name/repo"\nbranch    = "main"\n```'
         )
         return
+
+    st.subheader('📥 試合データ取得・更新')
 
     col1, col2 = st.columns(2)
     with col1:
@@ -345,8 +385,16 @@ def page_update(gh_cfg):
         else:
             st.warning(f'{ok_cnt} 件成功 / {fail_cnt} 件失敗')
 
-        st.info('RE24 キャッシュをクリアして再計算します...')
+        st.info('データキャッシュをクリアして再計算します...')
         reload_model()
+
+    st.divider()
+    st.subheader('📁 データソース')
+    st.markdown(
+        f'- 打席イベント: GitHub `data/gamedata/*_details.csv`\n'
+        f'- 状況別打者成績: `data/all_batters_situational.csv`\n'
+        f'- 過去3年成績: `data/2023~2025打撃データ/stats_YYYY.csv`'
+    )
 
 
 # ============================================================
@@ -361,31 +409,26 @@ def main():
         st.divider()
         page = st.radio(
             'メニュー',
-            ['🔮 得点期待値予測', '🗺 RE24 行列', '📥 データ更新'],
+            ['🔮 メイン（予測）', '⚙️ 設定（データ更新）'],
             label_visibility='collapsed',
         )
         st.divider()
         st.caption('PBP データから計算した RE24 × 打者 wOBA で場面ごとの期待得点を推定します。')
 
-    # ---- モデル読み込み（予測・RE24ページで必要） ----
-    if page in ('🔮 得点期待値予測', '🗺 RE24 行列'):
+    if page == '🔮 メイン（予測）':
         if not gh_cfg:
-            st.error('GitHub の認証情報が設定されていません。「📥 データ更新」ページを確認してください。')
+            st.error('GitHub の認証情報が設定されていません。「⚙️ 設定」ページを確認してください。')
             st.stop()
-        re24, counts, df_woba, league_avg, n_games, n_pa = load_model(
+        re24, counts, df_woba, league_avg, n_games, n_pa, df_career = load_model(
             gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
         )
         if n_games == 0:
-            st.info('試合データがありません。サイドバーから「📥 データ更新」を選択して取得してください。')
+            st.info('試合データがありません。サイドバーから「⚙️ 設定」を選択して取得してください。')
             st.stop()
+        page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career)
 
-    # ---- ページ描画 ----
-    if page == '🔮 得点期待値予測':
-        page_predict(re24, counts, df_woba, league_avg, n_games, n_pa)
-    elif page == '🗺 RE24 行列':
-        page_re24(re24, counts)
-    elif page == '📥 データ更新':
-        page_update(gh_cfg)
+    elif page == '⚙️ 設定（データ更新）':
+        page_settings(gh_cfg)
 
 
 if __name__ == '__main__':
