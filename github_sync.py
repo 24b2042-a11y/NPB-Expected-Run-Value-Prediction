@@ -2,8 +2,16 @@
 github_sync.py — GitHub リポジトリへの CSV 自動コミット＆読み込み
 Streamlit Cloud のファイルシステムは読み取り専用のため、
 データの永続化と読み込みをすべて GitHub API 経由で行う。
+
+【高速化】
+data/gamedata/ 配下のファイルを1件ずつ decoded_content で取得すると
+ファイル数分の API リクエストが発生し非常に遅くなる（N+1問題）。
+そこでリポジトリの zipball を1回のリクエストで取得し、ローカルで
+展開してから必要なファイルだけを読む方式に変更した。
 """
 import io
+import zipfile
+import requests
 import pandas as pd
 from github import Github, GithubException
 
@@ -75,6 +83,53 @@ def commit_game_files(
 
 
 # ============================================================
+# 【新規】リポジトリの zipball を1回のリクエストで取得し、
+# data/gamedata/*_details.csv をメモリ上に展開して返す。
+#
+# 従来: ファイル数 N 件につき N 回の API コール（decoded_content の遅延取得）
+# 改善: API コール 1 回（archive_link 取得）+ HTTP ダウンロード 1 回
+# ============================================================
+def _fetch_details_archive(
+    token: str,
+    repo_name: str,
+    branch: str = 'main',
+) -> list[tuple[str, pd.DataFrame]]:
+    """
+    Returns: [(filename, df), ...]  ※ *_details.csv のみ
+    """
+    repo = get_repo(token, repo_name)
+
+    # get_archive_link はリダイレクト先URLを1回のAPIコールで取得するだけ
+    archive_url = repo.get_archive_link('zipball', ref=branch)
+
+    resp = requests.get(
+        archive_url,
+        headers={'Authorization': f'token {token}'},
+        timeout=60,
+    )
+    resp.raise_for_status()
+
+    results: list[tuple[str, pd.DataFrame]] = []
+
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        # zip内のパスは "{owner}-{repo}-{sha}/data/gamedata/xxx.csv" の形式
+        target_names = [
+            n for n in zf.namelist()
+            if '/data/gamedata/' in n and n.endswith('_details.csv')
+        ]
+        for name in target_names:
+            try:
+                with zf.open(name) as f:
+                    df = pd.read_csv(f, encoding='utf-8-sig')
+                fname = name.rsplit('/', 1)[-1]
+                results.append((fname, df))
+            except Exception:
+                continue
+
+    return results
+
+
+# ============================================================
 # GitHub から _details.csv を全件読み込んで DataFrame を返す
 # ============================================================
 def load_details_from_github(
@@ -86,37 +141,24 @@ def load_details_from_github(
     data/gamedata/ 以下の *_details.csv を全件取得して DataFrame のリストを返す。
     Returns: (dfs, n_files)
     """
-    repo    = get_repo(token, repo_name)
     dfs     = []
     n_files = 0
 
-    try:
-        contents = repo.get_contents('data/gamedata', ref=branch)
-    except GithubException:
-        return [], 0
+    for fname, df in _fetch_details_archive(token, repo_name, branch):
+        df['game_id'] = fname.split('_', 1)[0]
 
-    for item in contents:
-        if not item.name.endswith('_details.csv'):
-            continue
-        try:
-            raw           = item.decoded_content
-            df            = pd.read_csv(io.BytesIO(raw), encoding='utf-8-sig')
-            df['game_id'] = item.name.split('_', 1)[0]
+        # ファイル名 "{game_id}_{card}_details.csv" からホーム/アウェイの
+        # 長い球団名を抽出する（card は "HomeAway" 形式で "vs." を含む）
+        card = fname.split('_', 1)[1].replace('_details.csv', '')
+        if 'vs.' in card:
+            home_raw, away_raw = card.split('vs.', 1)
+        else:
+            home_raw, away_raw = None, None
+        df['home_team_raw'] = home_raw
+        df['away_team_raw'] = away_raw
 
-            # ファイル名 "{game_id}_{card}_details.csv" からホーム/アウェイの
-            # 長い球団名を抽出する（card は "HomeAway" 形式で "vs." を含む）
-            card = item.name.split('_', 1)[1].replace('_details.csv', '')
-            if 'vs.' in card:
-                home_raw, away_raw = card.split('vs.', 1)
-            else:
-                home_raw, away_raw = None, None
-            df['home_team_raw'] = home_raw
-            df['away_team_raw'] = away_raw
-
-            dfs.append(df)
-            n_files += 1
-        except Exception:
-            continue
+        dfs.append(df)
+        n_files += 1
 
     return dfs, n_files
 
@@ -131,45 +173,32 @@ def get_existing_game_ids(
 ) -> tuple[set[int], set[int], int | None]:
     """
     data/gamedata/ 内の _details.csv を調べて以下を返す。
-    GitHub API はファイル名順で返すため、末尾のファイルが最新の game_id。
 
     Returns
     -------
     complete_ids   : 試合終了まで取得済みの game_id セット
     incomplete_ids : ファイルはあるが不完全（試合終了なし or 打席数<10）の game_id セット
-    latest_id      : ファイル一覧末尾の game_id（新規取得の開始点算出に使用）
+    latest_id      : 取得できたファイルの中で最大の game_id（新規取得の開始点算出に使用）
     """
-    repo           = get_repo(token, repo_name)
     complete_ids   = set()
     incomplete_ids = set()
     latest_id      = None
 
-    try:
-        contents = repo.get_contents('data/gamedata', ref=branch)
-    except GithubException:
-        return set(), set(), None
+    files = _fetch_details_archive(token, repo_name, branch)
 
-    # ファイル名順（= game_id昇順）で並んでいるため末尾が最新
-    detail_items = [c for c in contents if c.name.endswith('_details.csv')]
-
-    for item in detail_items:
+    for fname, df in files:
         try:
-            game_id = int(item.name.split('_', 1)[0])
-            raw     = item.decoded_content
-            df      = pd.read_csv(io.BytesIO(raw), encoding='utf-8-sig')
-
-            if _is_complete(df):
-                complete_ids.add(game_id)
-            else:
-                incomplete_ids.add(game_id)
+            game_id = int(fname.split('_', 1)[0])
         except Exception:
             continue
 
-    if detail_items:
-        try:
-            latest_id = int(detail_items[-1].name.split('_', 1)[0])
-        except Exception:
-            pass
+        if _is_complete(df):
+            complete_ids.add(game_id)
+        else:
+            incomplete_ids.add(game_id)
+
+        if latest_id is None or game_id > latest_id:
+            latest_id = game_id
 
     return complete_ids, incomplete_ids, latest_id
 
