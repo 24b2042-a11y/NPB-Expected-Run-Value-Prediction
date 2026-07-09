@@ -16,6 +16,9 @@ from core import (
     get_player_career, get_player_current_team, get_team_avg_runs,
     RUNNER_LABEL, RUNNER_MAP,
 )
+# build_model_from_dfs の戻り値に df_team_batting_stats（対戦球団ごとの
+# 打率・得点期待値）と df_situational_stats（状況別の打率・得点期待値）が
+# 追加されたのに合わせて main() 側の unpack と page_main() の引数を拡張。
 from scraper import scrape_games
 from github_sync import (
     commit_game_files,
@@ -144,7 +147,8 @@ def plot_career_trend(df_career):
 # ============================================================
 # メインページ: 得点期待値予測 + 選手個人成績
 # ============================================================
-def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs):
+def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
+              df_team_batting_stats, df_situational_stats):
     st.title('⚾ 得点期待値予測')
     st.caption(f'使用データ: {n_games} 試合 / {n_pa:,} 打席  |  リーグ平均 wOBA: {league_avg:.3f}')
     st.divider()
@@ -216,6 +220,23 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
              help=f'集計試合数: {n_team_games} 試合' if n_team_games else 'データなし')
     st.caption(f"リーグ平均 wOBA: {league_avg:.3f}")
 
+    # ---- 対戦球団ごとの実測打率・得点期待値（状況別ではない） ----
+    row = df_team_batting_stats[
+        (df_team_batting_stats['選手名'] == batter) &
+        (df_team_batting_stats['対戦球団'] == opponent)
+    ]
+    if not row.empty:
+        r = row.iloc[0]
+        e1, e2, e3 = st.columns(3)
+        e1.metric(f'実測打率 vs {opponent}',
+                 f"{r['打率']:.3f}" if r['打率'] is not None else 'N/A')
+        e2.metric(f'実測得点期待値 vs {opponent}',
+                 f"{r['得点期待値']:.3f}" if r['得点期待値'] is not None else 'N/A')
+        e3.metric('実測打席数（対戦球団）', f"{int(r['打席'])}")
+        st.caption('※ 実際のプレーバイプレーから集計した数値（アウト・ランナー状況は区切らない）')
+    else:
+        st.caption(f'{batter} vs {opponent} の実測データがありません。')
+
     st.divider()
 
     # ---- RE24 ヒートマップ ----
@@ -227,6 +248,16 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
             pd.DataFrame(counts, index=['0アウト','1アウト','2アウト'], columns=RUNNER_LABEL),
             use_container_width=True,
         )
+
+    # ---- 状況別の実測打率・得点期待値（球団を問わず全体） ----
+    st.subheader('📐 状況別 実測打率・得点期待値')
+    st.caption('全対戦相手を合わせた実際のプレーバイプレーから集計（標本数が少ない場面は N/A）')
+    st.dataframe(
+        df_situational_stats.style.background_gradient(
+            subset=['打率', '得点期待値'], cmap='RdYlGn',
+        ),
+        use_container_width=True, height=320,
+    )
 
     st.divider()
 
@@ -256,7 +287,9 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     # ---- 選手個人成績 ----
     st.subheader(f'👤 {batter} の個人成績')
 
-    tab_recent, tab_career = st.tabs(['今シーズン（対戦相手別）', '過去3年成績'])
+    tab_recent, tab_real, tab_career = st.tabs(
+        ['今シーズン（対戦相手別 wOBA）', '対戦球団別（実測打率・得点期待値）', '過去3年成績']
+    )
 
     with tab_recent:
         df_b = (df_woba[df_woba['選手名'] == batter][['区分名','打席','wOBA']]
@@ -267,6 +300,16 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
             st.caption('対戦相手別データ（打席10以上）がありません。')
         else:
             st.dataframe(df_b, use_container_width=True)
+
+    with tab_real:
+        df_r = (df_team_batting_stats[df_team_batting_stats['選手名'] == batter]
+                [['対戦球団','打席','打数','安打','打率','得点期待値']]
+                .sort_values('得点期待値', ascending=False))
+        if df_r.empty:
+            st.caption('実測データ（プレーバイプレー）がありません。')
+        else:
+            st.dataframe(df_r, use_container_width=True)
+            st.caption('打率・得点期待値は標本数が少ない（打席5未満）場合 N/A になります。')
 
     with tab_career:
         career = get_player_career(df_career, batter)
@@ -443,13 +486,15 @@ def main():
         if not gh_cfg:
             st.error('GitHub の認証情報が設定されていません。「⚙️ 設定」ページを確認してください。')
             st.stop()
-        re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs = load_model(
+        (re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
+         df_team_batting_stats, df_situational_stats) = load_model(
             gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
         )
         if n_games == 0:
             st.info('試合データがありません。サイドバーから「⚙️ 設定」を選択して取得してください。')
             st.stop()
-        page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs)
+        page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
+                  df_team_batting_stats, df_situational_stats)
 
     elif st.session_state['current_page'] == '⚙️ 設定（データ更新）':
         page_settings(gh_cfg)
