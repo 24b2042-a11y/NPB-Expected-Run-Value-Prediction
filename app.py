@@ -24,7 +24,10 @@ from github_sync import (
     commit_game_files,
     load_details_from_github,
     get_existing_game_ids,
+    save_batter_csv_to_github,
+    load_batter_csv_from_github,
 )
+from batter_scraper import scrape_all_batters
 
 st.set_page_config(
     page_title='NPB 得点期待値予測',
@@ -56,7 +59,13 @@ RUNNER_STR_MAP = {
 @st.cache_data(show_spinner='データを読み込んでいます...')
 def load_model(token: str, repo_name: str, branch: str):
     dfs, _ = load_details_from_github(token, repo_name, branch)
-    return build_model_from_dfs(dfs, BATTER_CSV, STATS_DIR)
+
+    # 対戦成績CSVはまずGitHub上の最新版を試し、なければリポジトリ同梱のローカル版を使う
+    batter_df = load_batter_csv_from_github(token, repo_name, branch)
+    if batter_df is None:
+        batter_df = pd.read_csv(BATTER_CSV, encoding='utf-8-sig')
+
+    return build_model_from_dfs(dfs, batter_df, STATS_DIR)
 
 
 def reload_model():
@@ -447,6 +456,47 @@ def page_settings(gh_cfg):
         f'- 状況別打者成績: `data/all_batters_situational.csv`\n'
         f'- 過去3年成績: `data/2023~2025打撃データ/stats_YYYY.csv`'
     )
+
+    st.divider()
+    st.subheader('👤 対戦成績データ（対戦相手別・球場別打率）の更新')
+    st.caption(
+        'nf3.sakura.ne.jp から全12球団・全選手の対戦相手別・球場別成績を再取得し、'
+        'GitHub の `data/all_batters_situational.csv` を更新します。選手数が多いため数分かかります。'
+    )
+    batter_sleep = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 1.5, 0.5, key='batter_sleep')
+
+    if st.button('🔄 対戦成績データを更新', type='secondary'):
+        progress_bar = st.progress(0, text='準備中...')
+        log_area = st.empty()
+
+        def on_progress(ti, n_teams, team_name, pi, n_players, player_name):
+            pct = (ti + pi / max(n_players, 1)) / n_teams
+            progress_bar.progress(min(pct, 1.0), text=f'[{team_name}] {player_name} ({pi}/{n_players})')
+            log_area.text(f'{team_name}: {player_name} を取得中 ({ti + 1}/{n_teams} 球団)')
+
+        with st.spinner('選手データを取得中...'):
+            df_batters = scrape_all_batters(sleep_sec=batter_sleep, on_progress=on_progress)
+
+        if df_batters.empty:
+            st.error(
+                'データを取得できませんでした。サイト構造が変わっている可能性があります。'
+                '「詳細」ボタン（フィードバック）から報告してください。'
+            )
+        else:
+            n_players = df_batters['選手名'].nunique()
+            st.success(f'✅ {n_players} 選手分・{len(df_batters):,} 行のデータを取得しました。')
+
+            with st.spinner('GitHub に保存中...'):
+                ok, msg = save_batter_csv_to_github(
+                    gh_cfg['token'], gh_cfg['repo_name'], df_batters, gh_cfg['branch']
+                )
+
+            if ok:
+                st.success(f'✅ GitHub に保存しました: {msg}')
+                st.info('データキャッシュをクリアして再計算します...')
+                reload_model()
+            else:
+                st.error(f'GitHub への保存に失敗しました: {msg}')
 
 
 # ============================================================
