@@ -1,7 +1,7 @@
 """
 core.py — RE24 計算・予測ロジック（Streamlit / Colab 共通）
 """
-import os, re, glob
+import os, re, glob, unicodedata
 import numpy as np
 import pandas as pd
 
@@ -14,6 +14,25 @@ RUNNER_MAP = {
 RUNNER_LABEL = ['走者なし', '1塁', '2塁', '3塁', '1,2塁', '1,3塁', '2,3塁', '満塁']
 WOBA_W       = dict(BB=0.70, HBP=0.73, S=0.89, D=1.27, T=1.61, HR=2.10)
 RE_SCORE     = re.compile(r'\S+\s+(\d+)-(\d+)\s+\S+')
+
+# 球団の正式名称（カード表記）→ 状況別データの区分名に統一するマッピング
+TEAM_NAME_MAP = [
+    ('広島', '広島'), ('中日', '中日'), ('ロッテ', 'ロッテ'), ('西武', '西武'),
+    ('オリックス', 'オリックス'), ('楽天', '楽天'), ('ソフトバンク', 'ソフトバンク'),
+    ('日本ハム', '日本ハム'), ('読売', '巨人'), ('阪神', '阪神'),
+    ('DeNA', 'ＤｅＮＡ'), ('ヤクルト', 'ヤクルト'),
+]
+
+
+def normalize_team_name(raw: str | None) -> str | None:
+    """カードの長い球団名を状況別データの区分名（短縮名）に変換する"""
+    if not raw:
+        return None
+    s = unicodedata.normalize('NFKC', raw)
+    for key, target in TEAM_NAME_MAP:
+        if key in s:
+            return target
+    return raw
 
 
 # ============================================================
@@ -51,16 +70,21 @@ def calc_runs_after(all_df: pd.DataFrame) -> pd.DataFrame:
 
         suffix = np.cumsum(delta[::-1])[::-1]
 
+        home_raw = grp['home_team_raw'].iloc[0] if 'home_team_raw' in grp.columns else None
+        away_raw = grp['away_team_raw'].iloc[0] if 'away_team_raw' in grp.columns else None
+
         for i, (_, row) in enumerate(grp.iterrows()):
             results.append({
-                'game_id':    game_id,
-                'イニング':   inning,
-                '打席順':     row['打席順'],
-                '選手名':     row['選手名'],
-                'アウト':     row['アウト'],
-                'ランナー':   row['ランナー'],
-                '本文':       row['本文'],
-                'runs_after': int(suffix[i]),
+                'game_id':       game_id,
+                'イニング':      inning,
+                '打席順':        row['打席順'],
+                '選手名':        row['選手名'],
+                'アウト':        row['アウト'],
+                'ランナー':      row['ランナー'],
+                '本文':          row['本文'],
+                'runs_after':    int(suffix[i]),
+                'home_team_raw': home_raw,
+                'away_team_raw': away_raw,
             })
     return pd.DataFrame(results)
 
@@ -93,6 +117,48 @@ def build_re24(df_runs: pd.DataFrame):
 
 
 # ============================================================
+# Step 3.5: チーム別・試合別の得点を集計
+# ============================================================
+def build_team_game_runs(df_runs: pd.DataFrame) -> pd.DataFrame:
+    """
+    df_runs（calc_runs_after の出力）から、各試合・各チームの総得点を計算する。
+
+    アルゴリズム:
+      各半イニングの「先頭打者（打席順=1）」の runs_after は、
+      そのイニングの suffix sum なのでイニング総得点そのものになる。
+      表イニング → アウェイチームの得点 / 裏イニング → ホームチームの得点
+      これを試合ごとに合算するとその試合のチーム総得点になる。
+
+    Returns
+    -------
+    DataFrame [game_id, team, runs]  team は正規化済みの短縮球団名
+    """
+    first = df_runs[df_runs['打席順'] == 1].copy()
+    if first.empty:
+        return pd.DataFrame(columns=['game_id', 'team', 'runs'])
+
+    def _team_raw(row):
+        return row['home_team_raw'] if '裏' in str(row['イニング']) else row['away_team_raw']
+
+    first['team_raw'] = first.apply(_team_raw, axis=1)
+    first['team']     = first['team_raw'].apply(normalize_team_name)
+
+    grouped = (first.groupby(['game_id', 'team'])['runs_after']
+              .sum().reset_index().rename(columns={'runs_after': 'runs'}))
+    return grouped
+
+
+def get_team_avg_runs(df_team_runs: pd.DataFrame, team: str) -> tuple[float | None, int]:
+    """
+    指定チームの1試合平均得点と集計試合数を返す。
+    """
+    sub = df_team_runs[df_team_runs['team'] == team]
+    if sub.empty:
+        return None, 0
+    return float(sub['runs'].mean()), len(sub)
+
+
+# ============================================================
 # Step 4: 打者 wOBA テーブルを構築
 # ============================================================
 def build_batter_woba(batter_csv: str):
@@ -110,7 +176,7 @@ def build_batter_woba(batter_csv: str):
     df['wOBA']      = np.where(df['wOBA_den'] >= 10,
                                df['wOBA_num'] / df['wOBA_den'], np.nan)
     league_avg      = df[df['wOBA_den'] >= 30]['wOBA'].mean()
-    return df[['選手名', '選手名_key', '区分名', '球団', '打席', 'wOBA']].copy(), float(league_avg)
+    return df[['選手名', '選手名_key', '区分名', '球団', '試合', '打席', 'wOBA']].copy(), float(league_avg)
 
 
 # ============================================================
@@ -128,10 +194,12 @@ def predict_one(re24, df_woba, league_avg,
     if len(hit) > 0 and not pd.isna(hit['wOBA'].values[0]):
         batter_woba = float(hit['wOBA'].values[0])
         pa          = int(hit['打席'].values[0])
+        games       = int(hit['試合'].values[0])
         note        = ''
     else:
         batter_woba = league_avg
         pa          = 0
+        games       = 0
         note        = f'※ {batter_name} vs {opponent} のデータなし → リーグ平均を使用'
 
     adj_re = (base_re * (batter_woba / league_avg)
@@ -142,6 +210,7 @@ def predict_one(re24, df_woba, league_avg,
         'ランナー':       runner if runner else '走者なし',
         '打者wOBA':       round(batter_woba, 3),
         '対戦打席数':     pa,
+        '対戦試合数':     games,
         '基礎RE24':       round(float(base_re), 3) if not np.isnan(base_re) else None,
         '補正後期待得点': round(float(adj_re),  3) if not np.isnan(adj_re)  else None,
         'note':           note,
@@ -225,6 +294,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_csv: str, stats_dir: st
         all_df   = concat_details(dfs)
         df_runs  = calc_runs_after(all_df)
         re24, counts = build_re24(df_runs)
+        df_team_runs = build_team_game_runs(df_runs)
         n_pa     = len(all_df)
     else:
         re24 = pd.DataFrame(
@@ -232,10 +302,11 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_csv: str, stats_dir: st
             index=pd.Index([0, 1, 2], name='アウト'),
             columns=pd.Index(RUNNER_LABEL, name='ランナー状態'),
         )
-        counts = np.zeros((3, 8), dtype=int)
-        n_pa   = 0
+        counts       = np.zeros((3, 8), dtype=int)
+        df_team_runs = pd.DataFrame(columns=['game_id', 'team', 'runs'])
+        n_pa         = 0
 
     df_woba, league_avg = build_batter_woba(batter_csv)
     df_career = load_career_stats(stats_dir) if stats_dir else pd.DataFrame()
 
-    return re24, counts, df_woba, league_avg, len(dfs), n_pa, df_career
+    return re24, counts, df_woba, league_avg, len(dfs), n_pa, df_career, df_team_runs
