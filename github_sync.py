@@ -102,6 +102,17 @@ def load_details_from_github(
             raw           = item.decoded_content
             df            = pd.read_csv(io.BytesIO(raw), encoding='utf-8-sig')
             df['game_id'] = item.name.split('_', 1)[0]
+
+            # ファイル名 "{game_id}_{card}_details.csv" からホーム/アウェイの
+            # 長い球団名を抽出する（card は "HomeAway" 形式で "vs." を含む）
+            card = item.name.split('_', 1)[1].replace('_details.csv', '')
+            if 'vs.' in card:
+                home_raw, away_raw = card.split('vs.', 1)
+            else:
+                home_raw, away_raw = None, None
+            df['home_team_raw'] = home_raw
+            df['away_team_raw'] = away_raw
+
             dfs.append(df)
             n_files += 1
         except Exception:
