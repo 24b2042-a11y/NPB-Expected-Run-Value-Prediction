@@ -17,66 +17,10 @@ RE_SCORE     = re.compile(r'\S+\s+(\d+)-(\d+)\s+\S+')
 
 # 球団の正式名称（カード表記）→ 状況別データの区分名に統一するマッピング
 TEAM_NAME_MAP = [
-    # パ・リーグ（表示されていなかった球団の表記ゆれ対策を大幅に強化）
-    ('オリックス', 'オリックス'),
-    ('バファローズ', 'オリックス'),
-    ('Bs', 'オリックス'),
-    ('BS', 'オリックス'),
-    ('bs', 'オリックス'),
-    
-    ('楽天', '楽天'),
-    ('イーグルス', '楽天'),
-    ('Eagles', '楽天'),
-    ('eagles', '楽天'),
-    
-    ('ソフトバンク', 'ソフトバンク'),
-    ('ホークス', 'ソフトバンク'),
-    ('Hawks', 'ソフトバンク'),
-    ('hawks', 'ソフトバンク'),
-    
-    ('西武', '西武'),
-    ('ライオンズ', '西武'),
-    ('Lions', '西武'),
-    ('lions', '西武'),
-    ('埼玉', '西武'),
-    
-    ('日本ハム', '日本ハム'),
-    ('ファイターズ', '日本ハム'),
-    ('Fighters', '日本ハム'),
-    ('fighters', '日本ハム'),
-    ('日ハム', '日本ハム'),
-    
-    ('ロッテ', 'ロッテ'),
-    ('マリーンズ', 'ロッテ'),
-    ('Marines', 'ロッテ'),
-    ('marines', 'ロッテ'),
-    
-    # セ・リーグ（将来的なゆれ防止のために合わせて強化）
-    ('広島', '広島'),
-    ('カープ', '広島'),
-    ('Carp', '広島'),
-    
-    ('中日', '中日'),
-    ('ドラゴンズ', '中日'),
-    ('Dragons', '中日'),
-    
-    ('読売', '巨人'),
-    ('巨人', '巨人'),
-    ('ジャイアンツ', '巨人'),
-    ('Giants', '巨人'),
-    
-    ('阪神', '阪神'),
-    ('タイガース', '阪神'),
-    ('Tigers', '阪神'),
-    
-    ('DeNA', 'ＤｅＮＡ'),
-    ('ベイスターズ', 'ＤｅＮＡ'),
-    ('横浜', 'ＤｅＮＡ'),
-    ('BayStars', 'ＤｅＮＡ'),
-    
-    ('ヤクルト', 'ヤクルト'),
-    ('スワローズ', 'ヤクルト'),
-    ('Swallows', 'ヤクルト'),
+    ('広島', '広島'), ('中日', '中日'), ('ロッテ', 'ロッテ'), ('西武', '西武'),
+    ('オリックス', 'オリックス'), ('楽天', '楽天'), ('ソフトバンク', 'ソフトバンク'),
+    ('日本ハム', '日本ハム'), ('読売', '巨人'), ('阪神', '阪神'),
+    ('DeNA', 'ＤｅＮＡ'), ('ヤクルト', 'ヤクルト'),
 ]
 
 
@@ -373,9 +317,8 @@ def build_situational_stats(df_runs: pd.DataFrame, min_pa: int = 5) -> pd.DataFr
 # ============================================================
 # Step 4: 打者 wOBA テーブルを構築
 # ============================================================
-def build_batter_woba(batter_csv: str):
-    df = pd.read_csv(batter_csv, encoding='utf-8-sig')
-    df = df[df['区分種別'] == '対戦相手'].copy()
+def build_batter_woba(df_raw: pd.DataFrame):
+    df = df_raw[df_raw['区分種別'] == '対戦相手'].copy()
     df['選手名_key'] = df['選手名'].str.replace(r'[\s　]', '', regex=True)
     df['1B_cnt']    = df['安打'] - df['2B'] - df['3B'] - df['本塁']
     df['wOBA_num']  = (WOBA_W['BB']  * df['四球'] +
@@ -497,9 +440,10 @@ def get_player_current_team(df_stats: pd.DataFrame, batter_name: str) -> str | N
 # ============================================================
 # モデル一括構築（DataFrame リストから）
 # ============================================================
-def build_model_from_dfs(dfs: list[pd.DataFrame], batter_csv: str, stats_dir: str | None = None):
+def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats_dir: str | None = None):
     """
     dfs: GitHub から読み込んだ _details.csv の DataFrame リスト
+    batter_df: 対戦相手別・球場別打撃成績（all_batters_situational.csv 相当）の DataFrame
     stats_dir: 過去3年成績 CSV が入っているディレクトリ（任意）
     """
     if dfs:
@@ -524,7 +468,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_csv: str, stats_dir: st
             columns=['アウト', 'ランナー状態', '打席', '打数', '安打', '打率', '得点期待値'])
         n_pa         = 0
 
-    df_woba, league_avg = build_batter_woba(batter_csv)
+    df_woba, league_avg = build_batter_woba(batter_df)
     df_career = load_career_stats(stats_dir) if stats_dir else pd.DataFrame()
 
     return (re24, counts, df_woba, league_avg, len(dfs), n_pa, df_career, df_team_runs,
