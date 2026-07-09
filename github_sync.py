@@ -21,16 +21,15 @@ def get_repo(token: str, repo_name: str):
 
 
 # ============================================================
-# CSV を data/gamedata/ に upsert（新規 or 上書き）
+# CSV を任意のパスに upsert（新規 or 上書き）
 # ============================================================
-def upsert_csv(
+def upsert_csv_at_path(
     repo,
     df: pd.DataFrame,
-    filename: str,
+    path: str,
     commit_message: str,
     branch: str = 'main',
 ) -> tuple[bool, str]:
-    path          = f'data/gamedata/{filename}'
     content_bytes = df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
 
     try:
@@ -53,6 +52,51 @@ def upsert_csv(
         return False, f'GitHub エラー: {e.status} {e.data}'
     except Exception as e:
         return False, f'予期せぬエラー: {e}'
+
+
+# ============================================================
+# CSV を data/gamedata/ に upsert（新規 or 上書き）
+# ============================================================
+def upsert_csv(
+    repo,
+    df: pd.DataFrame,
+    filename: str,
+    commit_message: str,
+    branch: str = 'main',
+) -> tuple[bool, str]:
+    path = f'data/gamedata/{filename}'
+    return upsert_csv_at_path(repo, df, path, commit_message, branch)
+
+
+# ============================================================
+# 対戦相手別・球場別打撃成績CSV（all_batters_situational.csv）の
+# GitHub への保存 / GitHub からの読み込み（単一ファイルなので
+# get_contents + decoded_content で1回のAPIコールのみ）
+# ============================================================
+def save_batter_csv_to_github(
+    token: str,
+    repo_name: str,
+    df: pd.DataFrame,
+    branch: str = 'main',
+    path: str = 'data/all_batters_situational.csv',
+) -> tuple[bool, str]:
+    repo = get_repo(token, repo_name)
+    return upsert_csv_at_path(repo, df, path, '[auto] update all_batters_situational.csv', branch)
+
+
+def load_batter_csv_from_github(
+    token: str,
+    repo_name: str,
+    branch: str = 'main',
+    path: str = 'data/all_batters_situational.csv',
+) -> pd.DataFrame | None:
+    repo = get_repo(token, repo_name)
+    try:
+        content = repo.get_contents(path, ref=branch)
+    except GithubException:
+        return None
+    raw = content.decoded_content
+    return pd.read_csv(io.BytesIO(raw), encoding='utf-8-sig')
 
 
 # ============================================================
