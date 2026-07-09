@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from core import (
     build_model_from_dfs, predict_one, predict_all,
-    get_player_career, get_player_current_team,
+    get_player_career, get_player_current_team, get_team_avg_runs,
     RUNNER_LABEL, RUNNER_MAP,
 )
 from scraper import scrape_games
@@ -144,7 +144,7 @@ def plot_career_trend(df_career):
 # ============================================================
 # メインページ: 得点期待値予測 + 選手個人成績
 # ============================================================
-def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career):
+def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs):
     st.title('⚾ 得点期待値予測')
     st.caption(f'使用データ: {n_games} 試合 / {n_pa:,} 打席  |  リーグ平均 wOBA: {league_avg:.3f}')
     st.divider()
@@ -205,7 +205,16 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career):
     if res['補正後期待得点'] and res['基礎RE24']:
         delta_str = str(round(res['補正後期待得点'] - res['基礎RE24'], 3))
     m3.metric('補正後期待得点', str(res['補正後期待得点'] or 'N/A'), delta=delta_str)
-    st.caption(f"対戦打席数: {res['対戦打席数']}  |  リーグ平均 wOBA: {league_avg:.3f}")
+
+    # ---- 対戦相手との対決状況 ----
+    avg_runs, n_team_games = get_team_avg_runs(df_team_runs, opponent)
+    d1, d2, d3 = st.columns(3)
+    d1.metric('対戦打席数', f"{res['対戦打席数']}")
+    d2.metric('対戦試合数', f"{res['対戦試合数']}")
+    d3.metric(f'{opponent} の1試合平均得点',
+             f'{avg_runs:.2f}' if avg_runs is not None else 'N/A',
+             help=f'集計試合数: {n_team_games} 試合' if n_team_games else 'データなし')
+    st.caption(f"リーグ平均 wOBA: {league_avg:.3f}")
 
     st.divider()
 
@@ -403,7 +412,7 @@ def page_settings(gh_cfg):
 def main():
     gh_cfg = get_github_cfg()
 
-    # 1. 起動時の初期ページを「メイン」に強制固定する仕組み
+    # 起動時の初期ページを「メイン」に固定
     if 'current_page' not in st.session_state:
         st.session_state['current_page'] = '🔮 メイン（予測）'
 
@@ -411,11 +420,8 @@ def main():
     with st.sidebar:
         st.markdown('## ⚾ NPB 得点期待値')
         st.divider()
-        
-        # 2. ラジオボタンに key を割り当て、セッション状態とカチッと同期させる
+
         page_options = ['🔮 メイン（予測）', '⚙️ 設定（データ更新）']
-        
-        # セッションに保存されているページが選択肢の何番目かを取得（安全対策）
         try:
             default_idx = page_options.index(st.session_state['current_page'])
         except ValueError:
@@ -426,31 +432,24 @@ def main():
             page_options,
             index=default_idx,
             label_visibility='collapsed',
-            key='sidebar_navigation',  # 明示的なキーを設定してバグを防ぐ
+            key='sidebar_navigation',
         )
-        
-        # ラジオボタンの変更をセッションに即時反映
         st.session_state['current_page'] = page
-        
+
         st.divider()
         st.caption('PBP データから計算した RE24 × 打者 wOBA で場面ごとの期待得点を推定します。')
 
-    # ---- ページ出し分けロジック ----
     if st.session_state['current_page'] == '🔮 メイン（予測）':
         if not gh_cfg:
-            st.error('GitHub の認証情報が設定されていません。「⚙️ 設定（データ更新）」ページを確認してください。')
+            st.error('GitHub の認証情報が設定されていません。「⚙️ 設定」ページを確認してください。')
             st.stop()
-            
-        re24, counts, df_woba, league_avg, n_games, n_pa, df_career = load_model(
+        re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs = load_model(
             gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
         )
-        
-        # もしデータが0件なら、画面を完全に止めずに、メッセージを出してユーザーが「設定」に手動で切り替えられるようにする
         if n_games == 0:
-            st.info('試合データがありません。サイドバーから「⚙️ 設定（データ更新）」を選択してデータを取得してください。')
+            st.info('試合データがありません。サイドバーから「⚙️ 設定」を選択して取得してください。')
             st.stop()
-            
-        page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career)
+        page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs)
 
     elif st.session_state['current_page'] == '⚙️ 設定（データ更新）':
         page_settings(gh_cfg)
