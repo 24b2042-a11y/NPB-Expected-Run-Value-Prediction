@@ -90,12 +90,35 @@ def load_batter_csv_from_github(
     branch: str = 'main',
     path: str = 'data/all_batters_situational.csv',
 ) -> pd.DataFrame | None:
+    """
+    GitHub Contents API は1MB超のファイルだと content(base64) を返さない
+    （encoding が 'none' になり decoded_content が使えない）ため、
+    download_url 経由で raw content を直接取得する。
+    """
     repo = get_repo(token, repo_name)
     try:
         content = repo.get_contents(path, ref=branch)
     except GithubException:
         return None
-    raw = content.decoded_content
+
+    if isinstance(content, list):
+        # 想定外だが、ディレクトリを指してしまった場合は None を返す
+        return None
+
+    try:
+        if content.encoding == 'base64':
+            raw = content.decoded_content
+        else:
+            resp = requests.get(
+                content.download_url,
+                headers={'Authorization': f'token {token}'},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            raw = resp.content
+    except Exception:
+        return None
+
     return pd.read_csv(io.BytesIO(raw), encoding='utf-8-sig')
 
 
