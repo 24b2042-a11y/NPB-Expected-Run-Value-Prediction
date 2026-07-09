@@ -36,6 +36,70 @@ def normalize_team_name(raw: str | None) -> str | None:
 
 
 # ============================================================
+# 本文テキストから打席結果を判定するためのキーワードパターン
+# 優先順位が重要：長打（二塁打/三塁打/本塁打）を単打より先に判定し、
+# 「ツーベース」「スリーベース」等の表記ゆれにも対応する。
+# けん制・投手交代・代打/代走・守備変更などの前置きノイズ文言には
+# これらのキーワードが含まれないことをサンプルデータで確認済み。
+# ============================================================
+RESULT_PATTERNS = [
+    ('HR',  re.compile(r'本塁打|ホームラン')),
+    ('3B',  re.compile(r'三塁打|スリーベース')),
+    ('2B',  re.compile(r'二塁打|ツーベース')),
+    ('IBB', re.compile(r'敬遠')),
+    ('BB',  re.compile(r'四球|フォアボール')),
+    ('HBP', re.compile(r'死球')),
+    ('SO',  re.compile(r'三振')),
+    ('1B',  re.compile(r'ヒット|安打')),
+    ('SF',  re.compile(r'犠飛|犠牲フライ')),
+    ('SAC', re.compile(r'バント')),
+    ('OUT', re.compile(r'ゴロ|フライ|ライナー|失策|エラー|併殺')),
+]
+
+# 安打として扱う結果コード
+HIT_CODES    = {'1B', '2B', '3B', 'HR'}
+# 打数（AB）に含めない結果コード（四球・死球・敬遠・犠打・犠飛）
+NON_AB_CODES = {'BB', 'IBB', 'HBP', 'SAC', 'SF'}
+
+
+def classify_result(text) -> str:
+    """
+    本文テキストから打席結果コードを判定する。
+    該当なしの場合は 'UNKNOWN' を返す（打率計算からは除外される）。
+    """
+    s = str(text) if text is not None else ''
+    for code, pattern in RESULT_PATTERNS:
+        if pattern.search(s):
+            return code
+    return 'UNKNOWN'
+
+
+def _opponent_team_raw(row) -> str | None:
+    """
+    打者側から見た対戦（相手）球団の生の名前を返す。
+    表イニング = アウェイチームが攻撃 → 対戦相手はホーム
+    裏イニング = ホームチームが攻撃 → 対戦相手はアウェイ
+    """
+    if '裏' in str(row.get('イニング', '')):
+        return row.get('away_team_raw')
+    return row.get('home_team_raw')
+
+
+def add_result_columns(df_runs: pd.DataFrame) -> pd.DataFrame:
+    """
+    df_runs（calc_runs_after の出力）に、打席結果・安打判定・打数対象判定・
+    対戦球団（正規化済み）の列を追加して返す。
+    """
+    df = df_runs.copy()
+    df['結果']   = df['本文'].apply(classify_result)
+    df['is_hit'] = df['結果'].isin(HIT_CODES)
+    df['is_ab']  = (~df['結果'].isin(NON_AB_CODES)) & (df['結果'] != 'UNKNOWN')
+    df['対戦球団_raw'] = df.apply(_opponent_team_raw, axis=1)
+    df['対戦球団']     = df['対戦球団_raw'].apply(normalize_team_name)
+    return df
+
+
+# ============================================================
 # Step 1: DataFrame リストを結合して型を整える
 # ============================================================
 def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
@@ -156,6 +220,98 @@ def get_team_avg_runs(df_team_runs: pd.DataFrame, team: str) -> tuple[float | No
     if sub.empty:
         return None, 0
     return float(sub['runs'].mean()), len(sub)
+
+
+# ============================================================
+# Step 3.6: 対戦球団ごとの打率・得点期待値（状況別ではない）
+# ============================================================
+def build_team_batting_stats(df_runs: pd.DataFrame, min_pa: int = 5) -> pd.DataFrame:
+    """
+    実際のプレーバイプレー（本文）から、選手×対戦球団ごとの
+    打率と得点期待値（状況を問わず runs_after の平均）を集計する。
+
+    打率 = 安打 / 打数（打数 = 打席 - 四球 - 死球 - 敬遠 - 犠打 - 犠飛）
+    得点期待値 = その選手がその球団と対戦した全打席の runs_after の平均
+                （アウト・ランナー状況では区切らない）
+
+    min_pa 未満の標本は打率・得点期待値を None にする（信頼性が低いため）。
+
+    Returns
+    -------
+    DataFrame [選手名, 対戦球団, 打席, 打数, 安打, 打率, 得点期待値]
+    """
+    df = add_result_columns(df_runs)
+    df = df[df['対戦球団'].notna()]
+
+    rows = []
+    for (batter, team), grp in df.groupby(['選手名', '対戦球団']):
+        pa   = len(grp)
+        ab   = int(grp['is_ab'].sum())
+        hits = int(grp['is_hit'].sum())
+        avg  = (hits / ab) if ab > 0 else np.nan
+        exp_runs = float(grp['runs_after'].mean())
+
+        enough = pa >= min_pa
+        rows.append({
+            '選手名':     batter,
+            '対戦球団':   team,
+            '打席':       pa,
+            '打数':       ab,
+            '安打':       hits,
+            '打率':       round(avg, 3) if (enough and not np.isnan(avg)) else None,
+            '得点期待値': round(exp_runs, 3) if enough else None,
+        })
+
+    return pd.DataFrame(rows).sort_values(['選手名', '対戦球団']).reset_index(drop=True)
+
+
+# ============================================================
+# Step 3.7: 状況別（アウト×ランナー）の打率・得点期待値
+# ============================================================
+def build_situational_stats(df_runs: pd.DataFrame, min_pa: int = 5) -> pd.DataFrame:
+    """
+    実際のプレーバイプレーから、アウト×ランナー状況ごとの
+    打率と得点期待値を集計する（対戦球団・選手は問わず全体）。
+    既存の build_re24（得点期待値のみ）を打率つきに拡張したもの。
+
+    Returns
+    -------
+    DataFrame [アウト, ランナー状態, 打席, 打数, 安打, 打率, 得点期待値]
+    """
+    df = add_result_columns(df_runs)
+    df['runner_idx'] = df['ランナー'].map(RUNNER_MAP).fillna(0).astype(int)
+
+    rows = []
+    for out in range(3):
+        for r_idx, r_label in enumerate(RUNNER_LABEL):
+            grp = df[(df['アウト'] == out) & (df['runner_idx'] == r_idx)]
+            pa  = len(grp)
+
+            if pa == 0:
+                rows.append({
+                    'アウト': out, 'ランナー状態': r_label,
+                    '打席': 0, '打数': 0, '安打': 0,
+                    '打率': None, '得点期待値': None,
+                })
+                continue
+
+            ab   = int(grp['is_ab'].sum())
+            hits = int(grp['is_hit'].sum())
+            avg  = (hits / ab) if ab > 0 else np.nan
+            exp_runs = float(grp['runs_after'].mean())
+
+            enough = pa >= min_pa
+            rows.append({
+                'アウト':       out,
+                'ランナー状態': r_label,
+                '打席':         pa,
+                '打数':         ab,
+                '安打':         hits,
+                '打率':         round(avg, 3) if (enough and not np.isnan(avg)) else None,
+                '得点期待値':   round(exp_runs, 3) if enough else None,
+            })
+
+    return pd.DataFrame(rows)
 
 
 # ============================================================
@@ -295,6 +451,8 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_csv: str, stats_dir: st
         df_runs  = calc_runs_after(all_df)
         re24, counts = build_re24(df_runs)
         df_team_runs = build_team_game_runs(df_runs)
+        df_team_batting_stats  = build_team_batting_stats(df_runs)
+        df_situational_stats   = build_situational_stats(df_runs)
         n_pa     = len(all_df)
     else:
         re24 = pd.DataFrame(
@@ -304,9 +462,14 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_csv: str, stats_dir: st
         )
         counts       = np.zeros((3, 8), dtype=int)
         df_team_runs = pd.DataFrame(columns=['game_id', 'team', 'runs'])
+        df_team_batting_stats = pd.DataFrame(
+            columns=['選手名', '対戦球団', '打席', '打数', '安打', '打率', '得点期待値'])
+        df_situational_stats = pd.DataFrame(
+            columns=['アウト', 'ランナー状態', '打席', '打数', '安打', '打率', '得点期待値'])
         n_pa         = 0
 
     df_woba, league_avg = build_batter_woba(batter_csv)
     df_career = load_career_stats(stats_dir) if stats_dir else pd.DataFrame()
 
-    return re24, counts, df_woba, league_avg, len(dfs), n_pa, df_career, df_team_runs
+    return (re24, counts, df_woba, league_avg, len(dfs), n_pa, df_career, df_team_runs,
+            df_team_batting_stats, df_situational_stats)
