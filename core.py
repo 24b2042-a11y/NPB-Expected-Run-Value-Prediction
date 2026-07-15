@@ -28,9 +28,20 @@ TEAM_NAME_MAP = [
 ]
 
 
-def normalize_team_name(raw: str | None) -> str | None:
+def normalize_team_name(raw) -> str | None:
     """カードの長い球団名を状況別データの区分名（短縮名）に変換する"""
-    if not raw:
+    # pandas 3.x の Arrow-backed 文字列型では欠損値が pd.NA になり、
+    # bool(pd.NA) や unicodedata.normalize(pd.NA) が TypeError になるため、
+    # pd.isna で安全に判定してから明示的に str へキャストする。
+    if raw is None:
+        return None
+    try:
+        if pd.isna(raw):
+            return None
+    except (TypeError, ValueError):
+        pass
+    raw = str(raw)
+    if not raw or raw.lower() in ('none', 'nan', '<na>'):
         return None
     s = unicodedata.normalize('NFKC', raw)
     for key, target in TEAM_NAME_MAP:
@@ -110,7 +121,9 @@ def add_result_columns(df_runs: pd.DataFrame) -> pd.DataFrame:
     df['is_ab']  = (~df['結果'].isin(NON_AB_CODES)) & (df['結果'] != 'UNKNOWN')
 
     game_teams = _extract_game_teams(df)
-    df['対戦球団_raw'] = df.apply(lambda row: _opponent_team_raw(row, game_teams), axis=1)
+    # astype(object) で明示的に素の Python str/None のみを持つ列に固定し、
+    # pandas 3.x の Arrow-backed string 型への自動昇格（pd.NA 混入）を防ぐ
+    df['対戦球団_raw'] = df.apply(lambda row: _opponent_team_raw(row, game_teams), axis=1).astype(object)
     df['対戦球団']     = df['対戦球団_raw'].apply(normalize_team_name)
     return df
 
