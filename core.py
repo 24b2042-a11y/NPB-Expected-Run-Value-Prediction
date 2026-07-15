@@ -289,76 +289,87 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     # 4. 【徹底修正】wOBA マッピング (「区分」と「区分名」の混同バグを完全回避)
     # ============================================================
     df_woba = pd.DataFrame(columns=['選手名', '区分名', '試合', '打席', 'wOBA'])
-    if batter_df is not None and not batter_df.empty:
-        col_map = {}
-        
-        # [Step 4-1] 最優先の厳密マッチ（本物の「名称」が入った列を狙い撃ち）
-        for col in batter_df.columns:
-            if col in ['選手名', '選手']:
-                col_map[col] = '選手名'
-            elif col in ['区分名', '対戦相手', '対象', '球場名']:
-                col_map[col] = '区分名'
-            elif col in ['試合', '試合数']:
-                col_map[col] = '試合'
-            elif col in ['打席', '打席数']:
-                col_map[col] = '打席'
-            elif col.lower() == 'woba':
-                col_map[col] = 'wOBA'
+if batter_df is not None and not batter_df.empty:
+    col_map = {}
 
-        # [Step 4-2] 漏れた列に対するフォールバック（部分一致）
-        mapped_targets = set(col_map.values())
-        for col in batter_df.columns:
-            if col in col_map:
-                continue
-            
-            if '選手' in col and '選手名' not in mapped_targets:
-                col_map[col] = '選手名'
-                mapped_targets.add('選手名')
-            elif 'woba' in col.lower() and 'wOBA' not in mapped_targets:
-                col_map[col] = 'wOBA'
-                mapped_targets.add('wOBA')
-            elif '打席' in col and '打席' not in mapped_targets:
-                col_map[col] = '打席'
-                mapped_targets.add('打席')
-            elif '試合' in col and '試合' not in mapped_targets:
-                col_map[col] = '試合'
-                mapped_targets.add('試合')
-            elif col == '区分':
-                # 単なる「区分」という列名は、「対戦相手」等の固定ラベル列である確率が高いため、一旦別扱いに退避
-                col_map[col] = '区分タイプ'
-            elif ('区分' in col or '対戦' in col or '球場' in col) and '区分名' not in mapped_targets:
-                col_map[col] = '区分名'
-                mapped_targets.add('区分名')
+    # [Step 4-1] 最優先の厳密マッチ
+    # 「区分名」の候補は優先順位付きリストにし、最初に見つかった1列だけを採用する。
+    # 例: 対戦相手 と 球場名 が両方存在する場合、対戦相手を優先し、球場名は無視する。
+    KATEGORY_PRIORITY = ['区分名', '対戦相手', '対象', '球場名']
 
-        # [Step 4-3] 安全弁: 「区分名」が最後まで抽出できず「区分タイプ」だけがある場合のみ昇格
-        if '区分名' not in col_map.values():
-            for k, v in list(col_map.items()):
-                if v == '区分タイプ':
-                    col_map[k] = '区分名'
+    for target_name in KATEGORY_PRIORITY:
+        if target_name in batter_df.columns and '区分名' not in col_map.values():
+            col_map[target_name] = '区分名'
+            break  # 1列だけ採用して終了
 
-        # リネームの実行と重複カラムの物理的削除
-        df_renamed = batter_df.rename(columns=col_map)
-        df_renamed = df_renamed.loc[:, ~df_renamed.columns.duplicated()]
+    for col in batter_df.columns:
+        if col in col_map:
+            continue
+        if col in ['選手名', '選手']:
+            col_map[col] = '選手名'
+        elif col in ['試合', '試合数']:
+            col_map[col] = '試合'
+        elif col in ['打席', '打席数']:
+            col_map[col] = '打席'
+        elif col.lower() == 'woba':
+            col_map[col] = 'wOBA'
 
-        # 不足しているカラムを安全なデフォルト値で補完
-        for col in ['選手名', '区分名', '試合', '打席', 'wOBA']:
-            if col not in df_renamed.columns:
-                if col in ['試合', '打席']:
-                    df_renamed[col] = 0
-                elif col == 'wOBA':
-                    df_renamed[col] = league_avg
-                else:
-                    df_renamed[col] = ''
+    # [Step 4-2] 漏れた列に対するフォールバック（部分一致）
+    mapped_targets = set(col_map.values())
+    for col in batter_df.columns:
+        if col in col_map:
+            continue
 
-        # 5カラムを確実に抽出
-        df_woba = df_renamed[['選手名', '区分名', '試合', '打席', 'wOBA']].copy()
+        if '選手' in col and '選手名' not in mapped_targets:
+            col_map[col] = '選手名'
+            mapped_targets.add('選手名')
+        elif 'woba' in col.lower() and 'wOBA' not in mapped_targets:
+            col_map[col] = 'wOBA'
+            mapped_targets.add('wOBA')
+        elif '打席' in col and '打席' not in mapped_targets:
+            col_map[col] = '打席'
+            mapped_targets.add('打席')
+        elif '試合' in col and '試合' not in mapped_targets:
+            col_map[col] = '試合'
+            mapped_targets.add('試合')
+        elif col == '区分':
+            col_map[col] = '区分タイプ'
+        # 「区分名」がまだ決まっていない場合のみ、対戦・球場系の列を拾う
+        elif ('区分' in col or '対戦' in col or '球場' in col) and '区分名' not in mapped_targets:
+            col_map[col] = '区分名'
+            mapped_targets.add('区分名')
 
-        # [Step 4-4] ヘッダー行などの不要データをパージ
-        invalid_values = {'対戦相手', '区分名', '選手名', '選手', '区分', '対戦', 'wOBA', 'woba'}
-        df_woba = df_woba[
-            ~df_woba['区分名'].astype(str).str.strip().isin(invalid_values) &
-            ~df_woba['選手名'].astype(str).str.strip().isin(invalid_values)
-        ]
+    # [Step 4-3] 安全弁
+    if '区分名' not in col_map.values():
+        for k, v in list(col_map.items()):
+            if v == '区分タイプ':
+                col_map[k] = '区分名'
+
+    # リネームの実行（重複は起きないはずだが、念のため残しておく）
+    df_renamed = batter_df.rename(columns=col_map)
+    df_renamed = df_renamed.loc[:, ~df_renamed.columns.duplicated()]
+
+    for col in ['選手名', '区分名', '試合', '打席', 'wOBA']:
+        if col not in df_renamed.columns:
+            if col in ['試合', '打席']:
+                df_renamed[col] = 0
+            elif col == 'wOBA':
+                df_renamed[col] = league_avg
+            else:
+                df_renamed[col] = ''
+
+    df_woba = df_renamed[['選手名', '区分名', '試合', '打席', 'wOBA']].copy()
+
+    # [Step 4-4] 不要データのパージ + 表記ゆれ対策（前後空白除去・全角→半角統一）
+    import unicodedata as _ud
+    df_woba['選手名'] = df_woba['選手名'].astype(str).str.strip().apply(lambda s: _ud.normalize('NFKC', s))
+    df_woba['区分名'] = df_woba['区分名'].astype(str).str.strip().apply(lambda s: _ud.normalize('NFKC', s))
+
+    invalid_values = {'対戦相手', '区分名', '選手名', '選手', '区分', '対戦', 'wOBA', 'woba', '球場名', 'nan', ''}
+    df_woba = df_woba[
+        ~df_woba['区分名'].isin(invalid_values) &
+        ~df_woba['選手名'].isin(invalid_values)
+    ]
 
     n_games = all_df['game_id'].nunique()
     n_pa = len(all_df)
