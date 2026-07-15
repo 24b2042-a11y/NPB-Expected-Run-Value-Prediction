@@ -1,5 +1,5 @@
 """
-app.py — RE24 得点期待値予測シミュレーター（Streamlit UI - 完全版）
+app.py — RE24 得点期待値予測シミュレーター（Streamlit UI - 対戦相手のみ版）
 """
 import os
 import glob
@@ -47,7 +47,7 @@ def load_local_data():
 
 def main():
     st.title("⚾ RE24 得点期待値予測システム")
-    st.markdown("対戦相手（球団）と球場ごとのwOBA特性を考慮し、ベイズ収縮を用いて各シチュエーションの得点期待値を予測します。")
+    st.markdown("対戦相手（球団）ごとのwOBA特性を考慮し、ベイズ収縮を用いて各シチュエーションの得点期待値を予測します。")
 
     # データのロード
     with st.spinner("データを読み込んでいます..."):
@@ -75,20 +75,15 @@ def main():
         batters = sorted(df_woba['選手名'].unique().tolist())
         selected_batter = st.selectbox("打者を選択", batters)
 
-        # 2. 対戦相手の選択
+        # 2. 対戦相手の選択（球場はUIから非表示にしました）
         opponents = sorted(df_woba[df_woba['区分'] == '対戦相手']['区分名'].unique().tolist())
         opponents = ["全体"] + opponents
         selected_opponent = st.selectbox("対戦相手を選択", opponents, index=0)
 
-        # 3. 球場の選択
-        stadiums = sorted(df_woba[df_woba['区分'] == '球場']['区分名'].unique().tolist())
-        stadiums = ["全体"] + stadiums
-        selected_stadium = st.selectbox("球場を選択", stadiums, index=0)
-
         st.write("---")
         st.subheader("特定シチュエーション予測")
         
-        # 4. アウト数とランナー状況の選択
+        # 3. アウト数とランナー状況の選択
         selected_out = st.radio("アウト数", [0, 1, 2], format_func=lambda x: f"{x}アウト", horizontal=True)
         selected_runner = st.selectbox("ランナー状況", RUNNER_LABEL)
 
@@ -101,10 +96,10 @@ def main():
         # --------------------------------------------------------
         st.header("🎯 シミュレーション結果")
         
-        # predict_one の呼び出し（引数の不整合を完全に修正）
+        # predict_one を呼び出す（球場引数には固定で "全体" を渡して無視させます）
         res = predict_one(
             re24, df_woba, league_avg, 
-            selected_batter, selected_opponent, selected_stadium, 
+            selected_batter, selected_opponent, "全体", 
             selected_out, selected_runner
         )
 
@@ -116,7 +111,7 @@ def main():
             )
         with sub_col2:
             st.metric(
-                label="打者予測wOBA (ダブル補正後)", 
+                label="打者予測wOBA (対戦相手補正後)", 
                 value=f"{res['打者wOBA']:.3f}"
             )
         with sub_col3:
@@ -136,10 +131,10 @@ def main():
         st.header("📋 24シチュエーション得点期待値マトリクス")
         st.write("打席完了までに、そのイニングで平均してあと何点入るかの予測値です。")
 
-        # predict_all の呼び出し（引数の不整合を完全に修正）
+        # predict_all を呼び出す（球場引数には固定で "全体" を渡して無視させます）
         df_all_preds = predict_all(
             re24, df_woba, league_avg, 
-            selected_batter, selected_opponent, selected_stadium
+            selected_batter, selected_opponent, "全体"
         )
 
         # 2Dピボットテーブルに整形して表示
