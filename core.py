@@ -1,5 +1,5 @@
 """
-core.py — RE24 計算・予測ロジック（Streamlit / Colab 共通）- バグ修正版
+core.py — RE24 計算・予測ロジック（Streamlit / Colab 共通）- 完全修正版
 """
 import os
 import re
@@ -29,7 +29,7 @@ TEAM_NAME_MAP = [
 
 def normalize_team_name(raw: str | None) -> str | None:
     """カードの長い球団名を状況別データの区分名（短縮名）に変換する"""
-    if not raw:
+    if not raw or raw in ('対戦相手', '対戦球団', '相手球団'):
         return None
     s = unicodedata.normalize('NFKC', raw)
     for key, target in TEAM_NAME_MAP:
@@ -102,7 +102,7 @@ def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     all_df['打席順']  = pd.to_numeric(all_df['打席順'],  errors='coerce').fillna(0).astype(int)
     all_df['打順']    = pd.to_numeric(all_df['打順'],    errors='coerce')
     
-    # ★【修正】空文字や欠損値を、集計ラベルと一致する「走者なし」に完全統一する
+    # 【修正点】空文字や欠損値を、集計用ラベルと一致する「走者なし」に統一して抜け漏れを防止
     all_df['ランナー'] = all_df['ランナー'].fillna('走者なし').replace({
         '': '走者なし', 
         'nan': '走者なし', 
@@ -112,16 +112,14 @@ def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
 
 
 # ============================================================
-# Step 2: イニング順の正しいソート ＆ 残り得点の計算（バグ修正済）
+# Step 2: イニング順の正しいソート ＆ 残り得点の計算
 # ============================================================
 def sort_by_inning_correctly(df: pd.DataFrame) -> pd.DataFrame:
-    """イニング文字列（10回裏が2回表より前に来る辞書順バグ）を、正しい時系列に並び替える"""
+    """イニング文字列（10回裏が2回表より前に来る辞書順バグ）を正しい時系列に並び替える"""
     def parse_inning_str(s):
         s = str(s)
-        # イニングの数字を抽出
         num_m = re.search(r'\d+', s)
         num = int(num_m.group()) if num_m else 0
-        # 「表」なら0、「裏」なら1とし、表裏順も正しく揃える
         side = 0 if '表' in s else 1
         return (num, side)
     
@@ -153,7 +151,7 @@ def calc_runs_after(all_df: pd.DataFrame) -> pd.DataFrame:
     df['total_score'] = df.groupby('game_id')['total_score'].ffill().bfill().fillna(0).astype(int)
     df['total_score'] = df.groupby('game_id')['total_score'].cummax()
 
-    # 4. 【修正点】イニングごとに diff() を取ることでイニングまたぎ・ゲーム初期スコア誤算入を完璧に防止
+    # 4. 【修正点】イニングごとに diff() を取り、イニングまたぎ・ゲーム初期スコア誤算入による高値バグを完璧に防止
     df['runs_on_play'] = df.groupby(['game_id', 'イニング'])['total_score'].diff().fillna(0).astype(int)
     df['runs_on_play'] = df['runs_on_play'].clip(lower=0)
 
@@ -287,11 +285,11 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     woba_den = ab_sum + bb_sum + hbp_sum + sf_sum
     league_avg = woba_num / woba_den if woba_den > 0 else 0.315
 
-   # 4. wOBA マッピング (重複カラムによるバグを完全に防止)
+    # 4. 【修正点】wOBA マッピング (重複カラムによる AttributeError 回避 & ヘッダー混入行の排除)
     df_woba = pd.DataFrame(columns=['選手名', '区分名', '試合', '打席', 'wOBA'])
     if batter_df is not None and not batter_df.empty:
         col_map = {}
-        mapped_targets = set()  # 既にマッピングしたターゲット名を記録して重複を防ぐ
+        mapped_targets = set()  # 重複登録防止用
         
         for col in batter_df.columns:
             if '選手' in col and '選手名' not in mapped_targets:
@@ -310,13 +308,11 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
                 col_map[col] = 'wOBA'
                 mapped_targets.add('wOBA')
 
-        # リネームの実行
+        # リネームの実行と重複カラムの物理的削除
         df_renamed = batter_df.rename(columns=col_map)
-        
-        # 安全弁：インプットデータ自体に最初から重複した列名がある場合、最初の1列だけを残す
         df_renamed = df_renamed.loc[:, ~df_renamed.columns.duplicated()]
 
-        # 不足しているカラムを補完
+        # 不足しているカラムを安全な値で補完（列名 col そのものが値に入るバグを防止）
         for col in ['選手名', '区分名', '試合', '打席', 'wOBA']:
             if col not in df_renamed.columns:
                 if col in ['試合', '打席']:
@@ -325,9 +321,16 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
                     df_renamed[col] = league_avg
                 else:
                     df_renamed[col] = ''
-                    
-        # 必要な5カラムのみを確実に抽出
+
+        # 5カラムを確実に抽出
         df_woba = df_renamed[['選手名', '区分名', '試合', '打席', 'wOBA']].copy()
+
+        # 【追加修正：ヘッダー「対戦相手」「選手名」などの混入データを完全パージ】
+        invalid_values = {'対戦相手', '区分名', '選手名', '選手', '区分', '対戦', 'wOBA', 'woba'}
+        df_woba = df_woba[
+            ~df_woba['区分名'].astype(str).str.strip().isin(invalid_values) &
+            ~df_woba['選手名'].astype(str).str.strip().isin(invalid_values)
+        ]
 
     n_games = all_df['game_id'].nunique()
     n_pa = len(all_df)
