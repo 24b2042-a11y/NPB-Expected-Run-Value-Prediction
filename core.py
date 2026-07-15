@@ -225,7 +225,7 @@ def get_team_avg_runs(df_team_runs: pd.DataFrame, team: str) -> tuple[float | No
 # ============================================================
 # Step 3.6: 対戦球団ごとの打率・得点期待値（状況別ではない）
 # ============================================================
-def build_team_batting_stats(df_runs: pd.DataFrame, min_pa: int = 5) -> pd.DataFrame:
+def build_team_batting_stats(df_runs: pd.DataFrame, min_pa: int = 1) -> pd.DataFrame:
     """
     実際のプレーバイプレー（本文）から、選手×対戦球団ごとの
     打率と得点期待値（状況を問わず runs_after の平均）を集計する。
@@ -235,6 +235,9 @@ def build_team_batting_stats(df_runs: pd.DataFrame, min_pa: int = 5) -> pd.DataF
                 （アウト・ランナー状況では区切らない）
 
     min_pa 未満の標本は打率・得点期待値を None にする（信頼性が低いため）。
+    デフォルトは1打席以上あれば数値を表示する（交流戦のように打席数が
+    少ない対戦相手でも実測値が見えるようにするため）。信頼性の判断は
+    打席数の列を見て利用側で行うことを想定している。
 
     Returns
     -------
@@ -242,6 +245,12 @@ def build_team_batting_stats(df_runs: pd.DataFrame, min_pa: int = 5) -> pd.DataF
     """
     df = add_result_columns(df_runs)
     df = df[df['対戦球団'].notna()]
+
+    # _details.csv の選手名は「田中 幹也」のように半角/全角スペース入りで
+    # 記録されているが、対戦成績CSV（batter_csv）側は「田中幹也」とスペースなし。
+    # 表記を統一しないと選手選択（df_woba側）と突き合わせできないため、
+    # ここでスペースを除去して batter_csv 側の表記に揃える。
+    df['選手名'] = df['選手名'].astype(str).apply(lambda s: re.sub(r'[\s　]', '', s))
 
     rows = []
     for (batter, team), grp in df.groupby(['選手名', '対戦球団']):
