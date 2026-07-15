@@ -280,7 +280,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     league_avg = woba_num / woba_den if woba_den > 0 else 0.315
 
     # ============================================================
-    # 4. 【拡張】wOBA マッピング (「区分（対戦相手/球場）」と「区分名」の明確な分離)
+    # 4. wOBA マッピング (「区分（対戦相手/球場）」と「区分名」の明確な分離)
     # ============================================================
     df_woba = pd.DataFrame(columns=['選手名', '区分', '区分名', '試合', '打席', 'wOBA'])
     if batter_df is not None and not batter_df.empty:
@@ -451,7 +451,7 @@ def predict_one(re24, df_woba, league_avg, batter, opponent, stadium, out, runne
     else:
         woba_overall = league_avg
 
-    C = 20  # 収縮定数（信頼性を担保する基準打席数）
+    C = 20  # 収縮定数
 
     # 1. 【対戦相手（球団）補正】
     opp_mult = 1.0
