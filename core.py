@@ -1,5 +1,5 @@
 """
-core.py — RE24 計算・予測ロジック（対戦相手＆球場 分離拡張版）
+core.py — RE24 計算・予測ロジック（引数の数自動判別 ＆ KeyError安全対策版）
 """
 import os
 import re
@@ -92,17 +92,39 @@ def add_result_columns(df_runs: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# Step 1: DataFrame リストを結合して型を整える
+# Step 1: DataFrame リストを結合して型を整える（安全対策強化版）
 # ============================================================
 def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     if not dfs:
         return pd.DataFrame()
-    all_df = pd.concat(dfs, ignore_index=True)
+    
+    processed_dfs = []
+    for i, df in enumerate(dfs):
+        df_copy = df.copy()
+        
+        # --- game_id の安全確保 ---
+        if 'game_id' not in df_copy.columns:
+            if '試合ID' in df_copy.columns:
+                df_copy['game_id'] = df_copy['試合ID']
+            elif '試合id' in df_copy.columns:
+                df_copy['game_id'] = df_copy['試合id']
+            else:
+                df_copy['game_id'] = f"game_auto_{i}"
+                
+        # --- 打席順 の安全確保 ---
+        if '打席順' not in df_copy.columns:
+            if '打席番号' in df_copy.columns:
+                df_copy['打席順'] = df_copy['打席番号']
+            else:
+                df_copy['打席順'] = range(1, len(df_copy) + 1)
+                
+        processed_dfs.append(df_copy)
+
+    all_df = pd.concat(processed_dfs, ignore_index=True)
     all_df['アウト']   = pd.to_numeric(all_df['アウト'],   errors='coerce').fillna(0).astype(int)
     all_df['打席順']  = pd.to_numeric(all_df['打席順'],  errors='coerce').fillna(0).astype(int)
     all_df['打順']    = pd.to_numeric(all_df['打順'],    errors='coerce')
     
-    # 空文字や欠損値を、「走者なし」に統一
     all_df['ランナー'] = all_df['ランナー'].fillna('走者なし').replace({
         '': '走者なし', 
         'nan': '走者なし', 
@@ -279,14 +301,10 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     woba_den = ab_sum + bb_sum + hbp_sum + sf_sum
     league_avg = woba_num / woba_den if woba_den > 0 else 0.315
 
-    # ============================================================
-    # 4. wOBA マッピング (「区分（対戦相手/球場）」と「区分名」の明確な分離)
-    # ============================================================
+    # 4. wOBA マッピング
     df_woba = pd.DataFrame(columns=['選手名', '区分', '区分名', '試合', '打席', 'wOBA'])
     if batter_df is not None and not batter_df.empty:
         col_map = {}
-        
-        # [Step 4-1] 厳密マッチ
         for col in batter_df.columns:
             if col in ['選手名', '選手']:
                 col_map[col] = '選手名'
@@ -301,12 +319,10 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
             elif col.lower() == 'woba':
                 col_map[col] = 'wOBA'
 
-        # [Step 4-2] 部分一致フォールバック
         mapped_targets = set(col_map.values())
         for col in batter_df.columns:
             if col in col_map:
                 continue
-            
             if '選手' in col and '選手名' not in mapped_targets:
                 col_map[col] = '選手名'
                 mapped_targets.add('選手名')
@@ -326,11 +342,9 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
                 col_map[col] = '区分'
                 mapped_targets.add('区分')
 
-        # リネーム実行と重複カラムの排除
         df_renamed = batter_df.rename(columns=col_map)
         df_renamed = df_renamed.loc[:, ~df_renamed.columns.duplicated()]
 
-        # 不足カラムを安全なデフォルト値で補完
         for col in ['選手名', '区分', '区分名', '試合', '打席', 'wOBA']:
             if col not in df_renamed.columns:
                 if col in ['試合', '打席']:
@@ -342,10 +356,8 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
                 else:
                     df_renamed[col] = ''
 
-        # 必要な6カラムを確実に抽出
         df_woba = df_renamed[['選手名', '区分', '区分名', '試合', '打席', 'wOBA']].copy()
 
-        # [Step 4-3] 安全＆超親切：もし「区分」列が空、または存在しなかった場合に備え、値から自動ラベリング
         team_names = set(target for _, target in TEAM_NAME_MAP)
         stadium_keywords = ['ドーム', '球場', 'スタジアム', 'フィールド', '宮城', 'マリン', '甲子園', '神宮', 'バンテリン', 'マツダ', 'PayPay', 'みずほ', 'エスコン', 'ほっともっと']
 
@@ -353,20 +365,15 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
             cat = str(row['区分']).strip()
             if cat in ['対戦相手', '球場']:
                 return cat
-            
-            # 区分名から自動判別
             name = str(row['区分名']).strip()
             if name in team_names:
                 return '対戦相手'
             if any(k in name for k in stadium_keywords):
                 return '球場'
-            
-            # デフォルト
             return '対戦相手'
 
         df_woba['区分'] = df_woba.apply(auto_classify_category, axis=1)
 
-        # [Step 4-4] ゴミデータを完全パージ
         invalid_values = {'対戦相手', '区分名', '選手名', '選手', '区分', '対戦', 'wOBA', 'woba'}
         df_woba = df_woba[
             ~df_woba['区分名'].astype(str).str.strip().isin(invalid_values) &
@@ -434,10 +441,29 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
 
 
 # ============================================================
-# 【予測ロジック：対戦相手・球場のダブル・ベイズ収縮補正対応】
+# 【予測ロジック：対戦相手・球場のダブル・ベイズ収縮補正＆可変引数対応仕様】
 # ============================================================
-def predict_one(re24, df_woba, league_avg, batter, opponent, stadium, out, runner):
-    """対戦相手補正と球場補正をダブルで考慮して、1つのシチュエーションの得点期待値を予測する"""
+def predict_one(re24, df_woba, league_avg, batter, opponent, *args, **kwargs):
+    """
+    対戦相手と球場の補正を考慮して、1つのシチュエーションの得点期待値を予測。
+    引数の個数の違いに自動適応するハイブリッド仕様。
+    
+    1) 引数7個の場合: predict_one(re24, df_woba, league_avg, batter, opponent, out, runner)
+    2) 引数8個の場合: predict_one(re24, df_woba, league_avg, batter, opponent, stadium, out, runner)
+    """
+    # 引数の個数を動的に解析
+    stadium = "全体"
+    if len(args) == 2:
+        # 球場(stadium)の指定がなく、直接 (out, runner) が渡された場合
+        out, runner = args
+    elif len(args) == 3:
+        # 通常の (stadium, out, runner) の順で渡された場合
+        stadium, out, runner = args
+    else:
+        out = kwargs.get('out', 0)
+        runner = kwargs.get('runner', '走者なし')
+        stadium = kwargs.get('stadium', '全体')
+
     try:
         val = re24.loc[out, runner]
         base_re = float(val) if pd.notna(val) else None
@@ -477,13 +503,13 @@ def predict_one(re24, df_woba, league_avg, batter, opponent, stadium, out, runne
             stad_woba_pred = (stad_pa * stad_woba_vs + C * woba_overall) / (stad_pa + C)
         stad_mult = stad_woba_pred / league_avg if league_avg > 0 else 1.0
 
-    # 最終的な期待得点の計算 (基礎期待値 × 対戦相手補正比率 × 球場補正比率)
+    # 最終的な期待得点の計算
     if base_re is not None:
         pred_re = base_re * opp_mult * stad_mult
     else:
         pred_re = None
 
-    # 補足ノートの作成
+    # 補足ノート
     notes = []
     if opponent and opponent != '全体' and opp_pa < 10:
         notes.append(f"対 {opponent}（{opp_pa}打席）")
@@ -494,7 +520,6 @@ def predict_one(re24, df_woba, league_avg, batter, opponent, stadium, out, runne
     if notes:
         note = f"{'・'.join(notes)} のデータが少ないため、全体成績（wOBA: {woba_overall:.3f}）を加重して予測を補正しています。"
 
-    # 総合的な補正後予測wOBA（対戦相手と球場の効果を掛け合わせたもの）
     combined_woba_pred = woba_overall * opp_mult * stad_mult
 
     return {
@@ -507,8 +532,17 @@ def predict_one(re24, df_woba, league_avg, batter, opponent, stadium, out, runne
     }
 
 
-def predict_all(re24, df_woba, league_avg, batter, opponent, stadium):
-    """24場面すべての予測結果をDataFrameにまとめて返す"""
+def predict_all(re24, df_woba, league_avg, batter, opponent, *args, **kwargs):
+    """
+    24場面すべての予測結果をDataFrameにまとめて返す。
+    こちらも引数の数の違い（ staduim の有無 ）に自動で追従します。
+    """
+    stadium = "全体"
+    if len(args) == 1:
+        stadium = args[0]
+    elif 'stadium' in kwargs:
+        stadium = kwargs['stadium']
+
     rows = []
     for out in [0, 1, 2]:
         for runner in RUNNER_LABEL:
