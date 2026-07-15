@@ -344,6 +344,35 @@ def build_batter_woba(df_raw: pd.DataFrame):
 
 
 # ============================================================
+# Step 4.5: 選手の全対戦相手平均 wOBA
+#   （対戦相手別データがない場合のフォールバック用）
+# ============================================================
+def get_batter_avg_woba(df_woba: pd.DataFrame, batter_name: str) -> tuple[float | None, int, int]:
+    """
+    指定選手の「全対戦相手」を通した wOBA を、打席数で加重平均して返す。
+    対戦相手ごとのデータが1件もない、または全て打席不足で wOBA が NaN の場合は
+    (None, 0, 0) を返す（呼び出し側でリーグ平均にフォールバックする）。
+
+    Returns
+    -------
+    (avg_woba, total_pa, total_games)
+    """
+    key = re.sub(r'[\s　]', '', batter_name)
+    sub = df_woba[df_woba['選手名_key'] == key]
+    if sub.empty:
+        return None, 0, 0
+
+    valid = sub[sub['wOBA'].notna() & (sub['打席'] > 0)]
+    if valid.empty:
+        return None, 0, 0
+
+    total_pa      = int(valid['打席'].sum())
+    weighted_woba = float((valid['wOBA'] * valid['打席']).sum() / total_pa)
+    total_games   = int(valid['試合'].sum())
+    return weighted_woba, total_pa, total_games
+
+
+# ============================================================
 # Step 5: 1場面の予測
 # ============================================================
 def predict_one(re24, df_woba, league_avg,
@@ -361,10 +390,17 @@ def predict_one(re24, df_woba, league_avg,
         games       = int(hit['試合'].values[0])
         note        = ''
     else:
-        batter_woba = league_avg
-        pa          = 0
-        games       = 0
-        note        = f'※ {batter_name} vs {opponent} のデータなし → リーグ平均を使用'
+        # 対戦相手別データがない場合は、リーグ平均ではなく
+        # その選手自身の全対戦相手平均 wOBA を優先して使用する
+        avg_woba, _avg_pa, _avg_games = get_batter_avg_woba(df_woba, batter_name)
+        pa    = 0
+        games = 0
+        if avg_woba is not None:
+            batter_woba = avg_woba
+            note = f'※ {batter_name} vs {opponent} のデータなし → {batter_name} の全対戦相手平均wOBAを使用'
+        else:
+            batter_woba = league_avg
+            note = f'※ {batter_name} vs {opponent} のデータなし → 選手データもないためリーグ平均を使用'
 
     adj_re = (base_re * (batter_woba / league_avg)
               if not np.isnan(base_re) and league_avg > 0 else np.nan)
