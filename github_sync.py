@@ -91,9 +91,15 @@ def load_batter_csv_from_github(
     path: str = 'data/all_batters_situational.csv',
 ) -> pd.DataFrame | None:
     """
-    GitHub Contents API は1MB超のファイルだと content(base64) を返さない
+    GitHub の Contents API は1MB超のファイルだと content(base64) を返さない
     （encoding が 'none' になり decoded_content が使えない）ため、
-    download_url 経由で raw content を直接取得する。
+    api.github.com に対して Accept: application/vnd.github.raw ヘッダーで
+    直接リクエストして raw content を取得する。
+
+    注意: content.download_url（raw.githubusercontent.com）は Fastly の CDN
+    キャッシュを経由するため、コミット直後でも数分間古い内容が返ってくることが
+    ある。api.github.com への直接リクエストはこのCDNを経由しないため、
+    常に最新のコミット内容を取得できる。
     """
     repo = get_repo(token, repo_name)
     try:
@@ -105,13 +111,18 @@ def load_batter_csv_from_github(
         # 想定外だが、ディレクトリを指してしまった場合は None を返す
         return None
 
+    api_url = f'https://api.github.com/repos/{repo_name}/contents/{path}'
     try:
-        if content.encoding == 'base64':
+        if content.encoding == 'base64' and content.size < 1_000_000:
             raw = content.decoded_content
         else:
             resp = requests.get(
-                content.download_url,
-                headers={'Authorization': f'token {token}'},
+                api_url,
+                params={'ref': branch},
+                headers={
+                    'Authorization': f'token {token}',
+                    'Accept': 'application/vnd.github.raw',
+                },
                 timeout=60,
             )
             resp.raise_for_status()
