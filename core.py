@@ -281,24 +281,47 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     woba_den = ab_sum + bb_sum + hbp_sum + sf_sum
     league_avg = woba_num / woba_den if woba_den > 0 else 0.315
 
-    # 4. wOBA マッピング
+   # 4. wOBA マッピング (重複カラムによるバグを完全に防止)
     df_woba = pd.DataFrame(columns=['選手名', '区分名', '試合', '打席', 'wOBA'])
     if batter_df is not None and not batter_df.empty:
         col_map = {}
+        mapped_targets = set()  # 既にマッピングしたターゲット名を記録して重複を防ぐ
+        
         for col in batter_df.columns:
-            if '選手' in col: col_map[col] = '選手名'
-            elif '区分' in col or '対戦' in col or '球場' in col: col_map[col] = '区分名'
-            elif '試合' in col: col_map[col] = '試合'
-            elif '打席' in col: col_map[col] = '打席'
-            elif 'wOBA' in col or 'woba' in col: col_map[col] = 'wOBA'
+            if '選手' in col and '選手名' not in mapped_targets:
+                col_map[col] = '選手名'
+                mapped_targets.add('選手名')
+            elif ('区分' in col or '対戦' in col or '球場' in col) and '区分名' not in mapped_targets:
+                col_map[col] = '区分名'
+                mapped_targets.add('区分名')
+            elif '試合' in col and '試合' not in mapped_targets:
+                col_map[col] = '試合'
+                mapped_targets.add('試合')
+            elif '打席' in col and '打席' not in mapped_targets:
+                col_map[col] = '打席'
+                mapped_targets.add('打席')
+            elif ('wOBA' in col or 'woba' in col) and 'wOBA' not in mapped_targets:
+                col_map[col] = 'wOBA'
+                mapped_targets.add('wOBA')
 
-        df_woba = batter_df.rename(columns=col_map)
+        # リネームの実行
+        df_renamed = batter_df.rename(columns=col_map)
+        
+        # 安全弁：インプットデータ自体に最初から重複した列名がある場合、最初の1列だけを残す
+        df_renamed = df_renamed.loc[:, ~df_renamed.columns.duplicated()]
+
+        # 不足しているカラムを補完
         for col in ['選手名', '区分名', '試合', '打席', 'wOBA']:
-            if col not in df_woba.columns:
-                if col in ['試合', '打席']: df_woba[col] = 0
-                elif col == 'wOBA': df_woba[col] = league_avg
-                else: df_woba[col] = ''
-        df_woba = df_woba[['選手名', '区分名', '試合', '打席', 'wOBA']].copy()
+            if col not in df_renamed.columns:
+                if col in ['試合', '打席']:
+                    df_renamed[col] = 0
+                elif col == 'wOBA':
+                    df_renamed[col] = league_avg
+                else:
+                    df_renamed[col] = ''
+                    
+        # 必要な5カラムのみを確実に抽出
+        df_woba = df_renamed[['選手名', '区分名', '試合', '打席', 'wOBA']].copy()
 
     n_games = all_df['game_id'].nunique()
     n_pa = len(all_df)
