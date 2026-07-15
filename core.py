@@ -289,8 +289,9 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     # 4. 【徹底修正】wOBA マッピング (「区分」と「区分名」の混同バグを完全回避)
     # ============================================================
     df_woba = pd.DataFrame(columns=['選手名', '区分名', '試合', '打席', 'wOBA'])
-if batter_df is not None and not batter_df.empty:
-    col_map = {}
+    if batter_df is not None and not batter_df.empty:
+        col_map = {}
+
 
     # [Step 4-1] 最優先の厳密マッチ
     # 「区分名」の候補は優先順位付きリストにし、最初に見つかった1列だけを採用する。
