@@ -1,5 +1,5 @@
 """
-core.py — RE24 計算・予測ロジック（引数の数自動判別 ＆ KeyError安全対策版）
+core.py — RE24 計算・予測ロジック（対戦試合数/球場試合数キー復元 ＆ 引数自動判別版）
 """
 import os
 import re
@@ -441,23 +441,19 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
 
 
 # ============================================================
-# 【予測ロジック：対戦相手・球場のダブル・ベイズ収縮補正＆可変引数対応仕様】
+# 【予測ロジック：KeyError完全解決 ＆ 可変引数対応ハイブリッド】
 # ============================================================
 def predict_one(re24, df_woba, league_avg, batter, opponent, *args, **kwargs):
     """
     対戦相手と球場の補正を考慮して、1つのシチュエーションの得点期待値を予測。
-    引数の個数の違いに自動適応するハイブリッド仕様。
     
     1) 引数7個の場合: predict_one(re24, df_woba, league_avg, batter, opponent, out, runner)
     2) 引数8個の場合: predict_one(re24, df_woba, league_avg, batter, opponent, stadium, out, runner)
     """
-    # 引数の個数を動的に解析
     stadium = "全体"
     if len(args) == 2:
-        # 球場(stadium)の指定がなく、直接 (out, runner) が渡された場合
         out, runner = args
     elif len(args) == 3:
-        # 通常の (stadium, out, runner) の順で渡された場合
         stadium, out, runner = args
     else:
         out = kwargs.get('out', 0)
@@ -479,26 +475,30 @@ def predict_one(re24, df_woba, league_avg, batter, opponent, *args, **kwargs):
 
     C = 20  # 収縮定数
 
-    # 1. 【対戦相手（球団）補正】
+    # 1. 【対戦相手（球団）補正とデータの取得】
     opp_mult = 1.0
     opp_pa = 0
+    opp_games = 0  # UI側でKeyErrorになるのを完全に防ぐため、明示的にカウントを管理
     opp_woba_pred = woba_overall
     if opponent and opponent != '全体':
         df_opp = df_woba[(df_woba['選手名'] == batter) & (df_woba['区分'] == '対戦相手') & (df_woba['区分名'] == opponent)]
         if not df_opp.empty:
             opp_pa = int(df_opp.iloc[0]['打席'])
+            opp_games = int(df_opp.iloc[0]['試合'])  # 試合数を安全にキャスト
             opp_woba_vs = float(df_opp.iloc[0]['wOBA'])
             opp_woba_pred = (opp_pa * opp_woba_vs + C * woba_overall) / (opp_pa + C)
         opp_mult = opp_woba_pred / league_avg if league_avg > 0 else 1.0
 
-    # 2. 【球場補正】
+    # 2. 【球場補正とデータの取得】
     stad_mult = 1.0
     stad_pa = 0
+    stad_games = 0  # 球場側の試合数も安全に管理
     stad_woba_pred = woba_overall
     if stadium and stadium != '全体':
         df_stad = df_woba[(df_woba['選手名'] == batter) & (df_woba['区分'] == '球場') & (df_woba['区分名'] == stadium)]
         if not df_stad.empty:
             stad_pa = int(df_stad.iloc[0]['打席'])
+            stad_games = int(df_stad.iloc[0]['試合'])
             stad_woba_vs = float(df_stad.iloc[0]['wOBA'])
             stad_woba_pred = (stad_pa * stad_woba_vs + C * woba_overall) / (stad_pa + C)
         stad_mult = stad_woba_pred / league_avg if league_avg > 0 else 1.0
@@ -522,20 +522,22 @@ def predict_one(re24, df_woba, league_avg, batter, opponent, *args, **kwargs):
 
     combined_woba_pred = woba_overall * opp_mult * stad_mult
 
+    # UI側 (app.py) が期待する全てのキーを確実に返却（KeyError完全排除）
     return {
         '基礎RE24': round(base_re, 3) if base_re is not None else None,
         '打者wOBA': round(combined_woba_pred, 3),
         '補正後期待得点': round(pred_re, 3) if pred_re is not None else None,
         '対戦打席数': opp_pa,
+        '対戦試合数': opp_games,  # ← ここを追加しました！
         '球場打席数': stad_pa,
+        '球場試合数': stad_games,  # ← 念のため球場試合数も追加
         'note': note
     }
 
 
 def predict_all(re24, df_woba, league_avg, batter, opponent, *args, **kwargs):
     """
-    24場面すべての予測結果をDataFrameにまとめて返す。
-    こちらも引数の数の違い（ staduim の有無 ）に自動で追従します。
+    24場面すべての予測結果をDataFrameにまとめて返す
     """
     stadium = "全体"
     if len(args) == 1:
@@ -554,6 +556,8 @@ def predict_all(re24, df_woba, league_avg, batter, opponent, *args, **kwargs):
                 '基礎RE24': res['基礎RE24'],
                 '補正後期待得点': res['補正後期待得点'],
                 '対戦打席数': res['対戦打席数'],
-                '球場打席数': res.get('球場打席数', 0)
+                '対戦試合数': res['対戦試合数'],
+                '球場打席数': res['球場打席数'],
+                '球場試合数': res['球場試合数']
             })
     return pd.DataFrame(rows)
