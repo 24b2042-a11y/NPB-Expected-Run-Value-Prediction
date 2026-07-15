@@ -17,6 +17,7 @@ RUNNER_MAP = {
 RUNNER_LABEL = ['走者なし', '1塁', '2塁', '3塁', '1,2塁', '1,3塁', '2,3塁', '満塁']
 WOBA_W       = dict(BB=0.70, HBP=0.73, S=0.89, D=1.27, T=1.61, HR=2.10)
 RE_SCORE     = re.compile(r'\S+\s+(\d+)-(\d+)\s+\S+')
+TEAM_LINE_RE = re.compile(r'(\S+)\s+(\d+)-(\d+)\s+(\S+)')
 
 # 球団の正式名称（カード表記）→ 状況別データの区分名に統一するマッピング
 TEAM_NAME_MAP = [
@@ -70,11 +71,32 @@ def classify_result(text) -> str:
     return 'UNKNOWN'
 
 
-def _opponent_team_raw(row) -> str | None:
+def _extract_game_teams(df_runs: pd.DataFrame) -> dict:
+    """
+    game_id ごとに (away_raw, home_raw) を本文のスコア表記から1回だけ確定する。
+    スコア表記は「アウェー 点-点 ホーム」の並びを想定。
+    """
+    teams = {}
+    for game_id, grp in df_runs.groupby('game_id'):
+        for body in grp['本文'].fillna(''):
+            m = TEAM_LINE_RE.search(str(body))
+            if m:
+                teams[game_id] = (m.group(1), m.group(4))
+                break
+    return teams
+
+
+def _opponent_team_raw(row, game_teams: dict) -> str | None:
     """打者側から見た対戦（相手）球団の生の名前を返す"""
+    pair = game_teams.get(row.get('game_id'))
+    if pair is None:
+        return None
+    away_raw, home_raw = pair
     if '裏' in str(row.get('イニング', '')):
-        return row.get('away_team_raw')
-    return row.get('home_team_raw')
+        # 裏＝ホームチームが打席 → 相手はアウェー
+        return away_raw
+    # 表＝アウェーチームが打席 → 相手はホーム
+    return home_raw
 
 
 def add_result_columns(df_runs: pd.DataFrame) -> pd.DataFrame:
@@ -86,7 +108,9 @@ def add_result_columns(df_runs: pd.DataFrame) -> pd.DataFrame:
     df['結果']   = df['本文'].apply(classify_result)
     df['is_hit'] = df['結果'].isin(HIT_CODES)
     df['is_ab']  = (~df['結果'].isin(NON_AB_CODES)) & (df['結果'] != 'UNKNOWN')
-    df['対戦球団_raw'] = df.apply(_opponent_team_raw, axis=1)
+
+    game_teams = _extract_game_teams(df)
+    df['対戦球団_raw'] = df.apply(lambda row: _opponent_team_raw(row, game_teams), axis=1)
     df['対戦球団']     = df['対戦球団_raw'].apply(normalize_team_name)
     return df
 
@@ -101,11 +125,11 @@ def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     all_df['アウト']   = pd.to_numeric(all_df['アウト'],   errors='coerce').fillna(0).astype(int)
     all_df['打席順']  = pd.to_numeric(all_df['打席順'],  errors='coerce').fillna(0).astype(int)
     all_df['打順']    = pd.to_numeric(all_df['打順'],    errors='coerce')
-    
+
     # ★【修正】空文字や欠損値を、集計ラベルと一致する「走者なし」に完全統一する
     all_df['ランナー'] = all_df['ランナー'].fillna('走者なし').replace({
-        '': '走者なし', 
-        'nan': '走者なし', 
+        '': '走者なし',
+        'nan': '走者なし',
         'None': '走者なし'
     })
     return all_df
@@ -123,7 +147,7 @@ def sort_by_inning_correctly(df: pd.DataFrame) -> pd.DataFrame:
         # 「表」なら0、「裏」なら1とし、表裏順も正しく揃える
         side = 0 if '表' in s else 1
         return (num, side)
-    
+
     df['_temp_sort'] = df['イニング'].apply(parse_inning_str)
     df = df.sort_values(['game_id', '_temp_sort', '打席順']).reset_index(drop=True)
     return df.drop(columns=['_temp_sort'])
@@ -291,7 +315,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     if batter_df is not None and not batter_df.empty:
         col_map = {}
         mapped_targets = set()  # 既にマッピングしたターゲット名を記録して重複を防ぐ
-        
+
         for col in batter_df.columns:
             if '選手' in col and '選手名' not in mapped_targets:
                 col_map[col] = '選手名'
@@ -311,7 +335,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
 
         # リネームの実行
         df_renamed = batter_df.rename(columns=col_map)
-        
+
         # 安全弁：インプットデータ自体に最初から重複した列名がある場合、最初の1列だけを残す
         df_renamed = df_renamed.loc[:, ~df_renamed.columns.duplicated()]
 
@@ -324,7 +348,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
                     df_renamed[col] = league_avg
                 else:
                     df_renamed[col] = ''
-                    
+
         # 必要な5カラムのみを確実に抽出
         df_woba = df_renamed[['選手名', '区分名', '試合', '打席', 'wOBA']].copy()
 
