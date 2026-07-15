@@ -1,5 +1,5 @@
 """
-app.py — RE24 得点期待値予測シミュレーター（Streamlit UI - 対戦相手のみ版）
+app.py — RE24 得点期待値予測シミュレーター（Streamlit UI - 対戦相手のみ ＆ パス修正版）
 """
 import os
 import glob
@@ -17,8 +17,14 @@ from core import (
 st.set_page_config(page_title="RE24得点期待値予測", layout="wide")
 
 def load_local_data():
-    """ローカルの data/ フォルダからCSVを自動ロードする"""
-    data_dir = "data"
+    """data/gamedata/ を最優先で探索し、なければ data/ からCSVを自動ロードする"""
+    # 優先ターゲットを data/gamedata に設定
+    data_dir = os.path.join("data", "gamedata")
+    
+    # もし data/gamedata が存在しない場合は、従来の data/ を見る
+    if not os.path.exists(data_dir):
+        data_dir = "data"
+        
     if not os.path.exists(data_dir):
         return [], None
     
@@ -35,13 +41,17 @@ def load_local_data():
             st.warning(f"ファイルの読み込みに失敗しました ({os.path.basename(f)}): {e}")
 
     # 選手状況別wOBAデータ（CSV）の読み込み
+    # data/gamedata/ にあればそれを、無ければ data/ 直下を探索
     batter_file = os.path.join(data_dir, "batter_woba.csv")
+    if not os.path.exists(batter_file) and data_dir != "data":
+        batter_file = os.path.join("data", "batter_woba.csv")
+        
     batter_df = None
     if os.path.exists(batter_file):
         try:
             batter_df = pd.read_csv(batter_file, encoding='utf-8-sig')
         except Exception as e:
-            st.warning(f"wOBAデータの読み込みに失敗しました (batter_woba.csv): {e}")
+            st.warning(f"wOBAデータの読み込みに失敗しました ({os.path.basename(batter_file)}): {e}")
             
     return dfs, batter_df
 
@@ -54,12 +64,14 @@ def main():
         dfs, batter_df = load_local_data()
 
     if not dfs:
-        st.error("⚠️ `data/` フォルダ内に試合詳細CSV（`details_*.csv`）が見つかりません。")
-        st.info("プロジェクトの `data` ディレクトリにCSVを配置してから再起動してください。")
+        st.error("⚠️ `data/gamedata/` フォルダ内に試合詳細CSV（`details_*.csv`）が見つかりません。")
+        st.info("CSVファイルを `data/gamedata/` ディレクトリに配置してからアプリをリロードしてください。")
         return
 
-    # モデルのビルド
-    stats_dir = "data"
+    # モデルのビルド（過去データ stats_*.csv も優先して data/gamedata から探す）
+    target_dir = os.path.join("data", "gamedata")
+    stats_dir = target_dir if os.path.exists(target_dir) else "data"
+    
     (re24, counts, df_woba, league_avg, n_games, n_pa, df_career,
      df_team_runs, df_team_batting_stats, df_situational_stats) = build_model_from_dfs(dfs, batter_df, stats_dir)
 
@@ -75,7 +87,7 @@ def main():
         batters = sorted(df_woba['選手名'].unique().tolist())
         selected_batter = st.selectbox("打者を選択", batters)
 
-        # 2. 対戦相手の選択（球場はUIから非表示にしました）
+        # 2. 対戦相手の選択
         opponents = sorted(df_woba[df_woba['区分'] == '対戦相手']['区分名'].unique().tolist())
         opponents = ["全体"] + opponents
         selected_opponent = st.selectbox("対戦相手を選択", opponents, index=0)
@@ -96,7 +108,6 @@ def main():
         # --------------------------------------------------------
         st.header("🎯 シミュレーション結果")
         
-        # predict_one を呼び出す（球場引数には固定で "全体" を渡して無視させます）
         res = predict_one(
             re24, df_woba, league_avg, 
             selected_batter, selected_opponent, "全体", 
@@ -131,7 +142,6 @@ def main():
         st.header("📋 24シチュエーション得点期待値マトリクス")
         st.write("打席完了までに、そのイニングで平均してあと何点入るかの予測値です。")
 
-        # predict_all を呼び出す（球場引数には固定で "全体" を渡して無視させます）
         df_all_preds = predict_all(
             re24, df_woba, league_avg, 
             selected_batter, selected_opponent, "全体"
