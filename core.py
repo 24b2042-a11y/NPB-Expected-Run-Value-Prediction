@@ -1,5 +1,5 @@
 """
-core.py — RE24 計算・予測ロジック（対戦試合数/球場試合数キー復元 ＆ 引数自動判別版）
+core.py — RE24 計算・予測ロジック（Streamlit / Colab 共通）- 完全修正版
 """
 import os
 import re
@@ -79,7 +79,7 @@ def _opponent_team_raw(row) -> str | None:
 
 def add_result_columns(df_runs: pd.DataFrame) -> pd.DataFrame:
     """
-    df_runsに、打席結果・安打判定・打数対象判定・
+    df_runs（calc_runs_after の出力）に、打席結果・安打判定・打数対象判定・
     対戦球団（正規化済み）の列を追加して返す。
     """
     df = df_runs.copy()
@@ -92,39 +92,17 @@ def add_result_columns(df_runs: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# Step 1: DataFrame リストを結合して型を整える（安全対策強化版）
+# Step 1: DataFrame リストを結合して型を整える
 # ============================================================
 def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     if not dfs:
         return pd.DataFrame()
-    
-    processed_dfs = []
-    for i, df in enumerate(dfs):
-        df_copy = df.copy()
-        
-        # --- game_id の安全確保 ---
-        if 'game_id' not in df_copy.columns:
-            if '試合ID' in df_copy.columns:
-                df_copy['game_id'] = df_copy['試合ID']
-            elif '試合id' in df_copy.columns:
-                df_copy['game_id'] = df_copy['試合id']
-            else:
-                df_copy['game_id'] = f"game_auto_{i}"
-                
-        # --- 打席順 の安全確保 ---
-        if '打席順' not in df_copy.columns:
-            if '打席番号' in df_copy.columns:
-                df_copy['打席順'] = df_copy['打席番号']
-            else:
-                df_copy['打席順'] = range(1, len(df_copy) + 1)
-                
-        processed_dfs.append(df_copy)
-
-    all_df = pd.concat(processed_dfs, ignore_index=True)
+    all_df = pd.concat(dfs, ignore_index=True)
     all_df['アウト']   = pd.to_numeric(all_df['アウト'],   errors='coerce').fillna(0).astype(int)
     all_df['打席順']  = pd.to_numeric(all_df['打席順'],  errors='coerce').fillna(0).astype(int)
     all_df['打順']    = pd.to_numeric(all_df['打順'],    errors='coerce')
     
+    # 空文字や欠損値を、集計用ラベルと一致する「走者なし」に統一して抜け漏れを防止
     all_df['ランナー'] = all_df['ランナー'].fillna('走者なし').replace({
         '': '走者なし', 
         'nan': '走者なし', 
@@ -137,7 +115,7 @@ def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
 # Step 2: イニング順の正しいソート ＆ 残り得点の計算
 # ============================================================
 def sort_by_inning_correctly(df: pd.DataFrame) -> pd.DataFrame:
-    """イニング文字列を正しい時系列に並び替える"""
+    """イニング文字列（10回裏が2回表より前に来る辞書順バグ）を正しい時系列に並び替える"""
     def parse_inning_str(s):
         s = str(s)
         num_m = re.search(r'\d+', s)
@@ -151,13 +129,15 @@ def sort_by_inning_correctly(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def calc_runs_after(all_df: pd.DataFrame) -> pd.DataFrame:
-    """イニング内得点差分計算ロジック"""
+    """イニング内得点差分計算ロジック（イニング独立処理で相手チーム得点の混入を防止）"""
     if all_df.empty:
         return all_df
 
     df = all_df.copy()
+    # 1. 完璧なイニング順に並び替え
     df = sort_by_inning_correctly(df)
 
+    # 2. 得点のパース
     scores = []
     for body in df['本文'].fillna(''):
         m = RE_SCORE.search(body)
@@ -167,12 +147,15 @@ def calc_runs_after(all_df: pd.DataFrame) -> pd.DataFrame:
             scores.append(None)
     df['total_score'] = scores
 
+    # 3. ゲームごとのパースエラーの穴埋めと単調増加補正
     df['total_score'] = df.groupby('game_id')['total_score'].ffill().bfill().fillna(0).astype(int)
     df['total_score'] = df.groupby('game_id')['total_score'].cummax()
 
+    # 4. イニングごとに diff() を取り、イニングまたぎ・ゲーム初期スコア誤算入による高値バグを完璧に防止
     df['runs_on_play'] = df.groupby(['game_id', 'イニング'])['total_score'].diff().fillna(0).astype(int)
     df['runs_on_play'] = df['runs_on_play'].clip(lower=0)
 
+    # 5. 各打席開始時点からイニング終了までの総残り得点(runs_after)を算出
     df['runs_after'] = df.groupby(['game_id', 'イニング'])['runs_on_play'].transform(lambda x: x[::-1].cumsum()[::-1])
 
     return df
@@ -257,20 +240,21 @@ def get_player_current_team(df_career: pd.DataFrame, batter: str) -> str | None:
 # モデル構築（メインエントリーポイント）
 # ============================================================
 def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None, stats_dir: str):
+    """app.pyの load_model から呼び出されるモデルデータビルド"""
     if not dfs:
         empty_re24 = pd.DataFrame(0.0, index=[0, 1, 2], columns=RUNNER_LABEL)
         empty_counts = pd.DataFrame(0, index=[0, 1, 2], columns=RUNNER_LABEL)
         return (empty_re24, empty_counts, pd.DataFrame(), 0.315, 0, 0,
                 pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
-    # 1. 結合・残り得点の計算
+    # 1. 結合・イニング別残り得点の計算
     all_df = concat_details(dfs)
     df_runs = calc_runs_after(all_df)
     df_runs = add_result_columns(df_runs)
 
     df_runs['選手名'] = df_runs.get('打者', df_runs.get('選手名', '')).fillna('')
 
-    # 2. 有効打席のみのRE24用データ抽出
+    # 2. RE24 計算時に「投手交代」「代打」などの打席を伴わないノイズイベントを完全排除
     df_runs_for_re24 = df_runs[(df_runs['結果'] != 'UNKNOWN') & (df_runs['アウト'].isin([0, 1, 2]))]
 
     re24_pivot = df_runs_for_re24.pivot_table(index='アウト', columns='ランナー', values='runs_after', aggfunc='mean')
@@ -301,15 +285,17 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     woba_den = ab_sum + bb_sum + hbp_sum + sf_sum
     league_avg = woba_num / woba_den if woba_den > 0 else 0.315
 
-    # 4. wOBA マッピング
-    df_woba = pd.DataFrame(columns=['選手名', '区分', '区分名', '試合', '打席', 'wOBA'])
+    # ============================================================
+    # 4. 【徹底修正】wOBA マッピング (「区分」と「区分名」の混同バグを完全回避)
+    # ============================================================
+    df_woba = pd.DataFrame(columns=['選手名', '区分名', '試合', '打席', 'wOBA'])
     if batter_df is not None and not batter_df.empty:
         col_map = {}
+        
+        # [Step 4-1] 最優先の厳密マッチ（本物の「名称」が入った列を狙い撃ち）
         for col in batter_df.columns:
             if col in ['選手名', '選手']:
                 col_map[col] = '選手名'
-            elif col == '区分':
-                col_map[col] = '区分'
             elif col in ['区分名', '対戦相手', '対象', '球場名']:
                 col_map[col] = '区分名'
             elif col in ['試合', '試合数']:
@@ -319,10 +305,12 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
             elif col.lower() == 'woba':
                 col_map[col] = 'wOBA'
 
+        # [Step 4-2] 漏れた列に対するフォールバック（部分一致）
         mapped_targets = set(col_map.values())
         for col in batter_df.columns:
             if col in col_map:
                 continue
+            
             if '選手' in col and '選手名' not in mapped_targets:
                 col_map[col] = '選手名'
                 mapped_targets.add('選手名')
@@ -335,45 +323,37 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
             elif '試合' in col and '試合' not in mapped_targets:
                 col_map[col] = '試合'
                 mapped_targets.add('試合')
-            elif ('区分名' in col or '対戦' in col or '球場' in col) and '区分名' not in mapped_targets:
+            elif col == '区分':
+                # 単なる「区分」という列名は、「対戦相手」等の固定ラベル列である確率が高いため、一旦別扱いに退避
+                col_map[col] = '区分タイプ'
+            elif ('区分' in col or '対戦' in col or '球場' in col) and '区分名' not in mapped_targets:
                 col_map[col] = '区分名'
                 mapped_targets.add('区分名')
-            elif '区分' in col and '区分' not in mapped_targets:
-                col_map[col] = '区分'
-                mapped_targets.add('区分')
 
+        # [Step 4-3] 安全弁: 「区分名」が最後まで抽出できず「区分タイプ」だけがある場合のみ昇格
+        if '区分名' not in col_map.values():
+            for k, v in list(col_map.items()):
+                if v == '区分タイプ':
+                    col_map[k] = '区分名'
+
+        # リネームの実行と重複カラムの物理的削除
         df_renamed = batter_df.rename(columns=col_map)
         df_renamed = df_renamed.loc[:, ~df_renamed.columns.duplicated()]
 
-        for col in ['選手名', '区分', '区分名', '試合', '打席', 'wOBA']:
+        # 不足しているカラムを安全なデフォルト値で補完
+        for col in ['選手名', '区分名', '試合', '打席', 'wOBA']:
             if col not in df_renamed.columns:
                 if col in ['試合', '打席']:
                     df_renamed[col] = 0
                 elif col == 'wOBA':
                     df_renamed[col] = league_avg
-                elif col == '区分':
-                    df_renamed[col] = ''
                 else:
                     df_renamed[col] = ''
 
-        df_woba = df_renamed[['選手名', '区分', '区分名', '試合', '打席', 'wOBA']].copy()
+        # 5カラムを確実に抽出
+        df_woba = df_renamed[['選手名', '区分名', '試合', '打席', 'wOBA']].copy()
 
-        team_names = set(target for _, target in TEAM_NAME_MAP)
-        stadium_keywords = ['ドーム', '球場', 'スタジアム', 'フィールド', '宮城', 'マリン', '甲子園', '神宮', 'バンテリン', 'マツダ', 'PayPay', 'みずほ', 'エスコン', 'ほっともっと']
-
-        def auto_classify_category(row):
-            cat = str(row['区分']).strip()
-            if cat in ['対戦相手', '球場']:
-                return cat
-            name = str(row['区分名']).strip()
-            if name in team_names:
-                return '対戦相手'
-            if any(k in name for k in stadium_keywords):
-                return '球場'
-            return '対戦相手'
-
-        df_woba['区分'] = df_woba.apply(auto_classify_category, axis=1)
-
+        # [Step 4-4] ヘッダー行などの不要データをパージ
         invalid_values = {'対戦相手', '区分名', '選手名', '選手', '区分', '対戦', 'wOBA', 'woba'}
         df_woba = df_woba[
             ~df_woba['区分名'].astype(str).str.strip().isin(invalid_values) &
@@ -386,7 +366,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     df_career = load_career_stats(stats_dir)
     df_team_runs = build_team_runs(df_runs)
 
-    # 5. 球団別対戦成績
+    # 5. 球団別対戦成績 (UNKNOWN を除いた有効打撃プレーのみ対象)
     df_runs_valid = df_runs_for_re24[df_runs_for_re24['対戦球団'].notna() & (df_runs_for_re24['選手名'] != '')]
     if not df_runs_valid.empty:
         stats_rows = []
@@ -412,7 +392,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     else:
         df_team_batting_stats = pd.DataFrame(columns=['選手名', '対戦球団', '打席', '打数', '安打', '打率', '得点期待値'])
 
-    # 6. 状況別成績
+    # 6. 状況別成績 (こちらも UNKNOWN を除いた有効データを反映)
     situ_rows = []
     for out in [0, 1, 2]:
         for runner in RUNNER_LABEL:
@@ -441,123 +421,66 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
 
 
 # ============================================================
-# 【予測ロジック：KeyError完全解決 ＆ 可変引数対応ハイブリッド】
+# 予測ロジック
 # ============================================================
-def predict_one(re24, df_woba, league_avg, batter, opponent, *args, **kwargs):
-    """
-    対戦相手と球場の補正を考慮して、1つのシチュエーションの得点期待値を予測。
-    
-    1) 引数7個の場合: predict_one(re24, df_woba, league_avg, batter, opponent, out, runner)
-    2) 引数8個の場合: predict_one(re24, df_woba, league_avg, batter, opponent, stadium, out, runner)
-    """
-    stadium = "全体"
-    if len(args) == 2:
-        out, runner = args
-    elif len(args) == 3:
-        stadium, out, runner = args
-    else:
-        out = kwargs.get('out', 0)
-        runner = kwargs.get('runner', '走者なし')
-        stadium = kwargs.get('stadium', '全体')
-
+def predict_one(re24, df_woba, league_avg, batter, opponent, out, runner):
+    """特定の場面の得点期待値を予測する（ベイズ収縮補正入り）"""
     try:
         val = re24.loc[out, runner]
         base_re = float(val) if pd.notna(val) else None
     except Exception:
         base_re = None
 
-    # 打者全体の wOBA 算出
+    df_b = df_woba[(df_woba['選手名'] == batter) & (df_woba['区分名'] == opponent)]
+    if not df_b.empty:
+        pa = int(df_b.iloc[0]['打席'])
+        games = int(df_b.iloc[0].get('試合', 0))
+        woba_vs = float(df_b.iloc[0]['wOBA'])
+    else:
+        pa = 0
+        games = 0
+        woba_vs = league_avg
+
     df_all_b = df_woba[df_woba['選手名'] == batter]
     if not df_all_b.empty and df_all_b['打席'].sum() > 0:
         woba_overall = (df_all_b['wOBA'] * df_all_b['打席']).sum() / df_all_b['打席'].sum()
     else:
         woba_overall = league_avg
 
-    C = 20  # 収縮定数
+    C = 20
+    woba_pred = (pa * woba_vs + C * woba_overall) / (pa + C) if (pa + C) > 0 else league_avg
 
-    # 1. 【対戦相手（球団）補正とデータの取得】
-    opp_mult = 1.0
-    opp_pa = 0
-    opp_games = 0  # UI側でKeyErrorになるのを完全に防ぐため、明示的にカウントを管理
-    opp_woba_pred = woba_overall
-    if opponent and opponent != '全体':
-        df_opp = df_woba[(df_woba['選手名'] == batter) & (df_woba['区分'] == '対戦相手') & (df_woba['区分名'] == opponent)]
-        if not df_opp.empty:
-            opp_pa = int(df_opp.iloc[0]['打席'])
-            opp_games = int(df_opp.iloc[0]['試合'])  # 試合数を安全にキャスト
-            opp_woba_vs = float(df_opp.iloc[0]['wOBA'])
-            opp_woba_pred = (opp_pa * opp_woba_vs + C * woba_overall) / (opp_pa + C)
-        opp_mult = opp_woba_pred / league_avg if league_avg > 0 else 1.0
-
-    # 2. 【球場補正とデータの取得】
-    stad_mult = 1.0
-    stad_pa = 0
-    stad_games = 0  # 球場側の試合数も安全に管理
-    stad_woba_pred = woba_overall
-    if stadium and stadium != '全体':
-        df_stad = df_woba[(df_woba['選手名'] == batter) & (df_woba['区分'] == '球場') & (df_woba['区分名'] == stadium)]
-        if not df_stad.empty:
-            stad_pa = int(df_stad.iloc[0]['打席'])
-            stad_games = int(df_stad.iloc[0]['試合'])
-            stad_woba_vs = float(df_stad.iloc[0]['wOBA'])
-            stad_woba_pred = (stad_pa * stad_woba_vs + C * woba_overall) / (stad_pa + C)
-        stad_mult = stad_woba_pred / league_avg if league_avg > 0 else 1.0
-
-    # 最終的な期待得点の計算
-    if base_re is not None:
-        pred_re = base_re * opp_mult * stad_mult
+    if base_re is not None and league_avg > 0:
+        pred_re = base_re * (woba_pred / league_avg)
     else:
         pred_re = None
 
-    # 補足ノート
-    notes = []
-    if opponent and opponent != '全体' and opp_pa < 10:
-        notes.append(f"対 {opponent}（{opp_pa}打席）")
-    if stadium and stadium != '全体' and stad_pa < 10:
-        notes.append(f"球場 {stadium}（{stad_pa}打席）")
-    
     note = None
-    if notes:
-        note = f"{'・'.join(notes)} のデータが少ないため、全体成績（wOBA: {woba_overall:.3f}）を加重して予測を補正しています。"
+    if pa < 10:
+        note = f"対 {opponent} の打席数（{pa}打席）が少ないため、全体成績（wOBA: {woba_overall:.3f}）を加重して予測を補正しています。"
 
-    combined_woba_pred = woba_overall * opp_mult * stad_mult
-
-    # UI側 (app.py) が期待する全てのキーを確実に返却（KeyError完全排除）
     return {
         '基礎RE24': round(base_re, 3) if base_re is not None else None,
-        '打者wOBA': round(combined_woba_pred, 3),
+        '打者wOBA': round(woba_pred, 3),
         '補正後期待得点': round(pred_re, 3) if pred_re is not None else None,
-        '対戦打席数': opp_pa,
-        '対戦試合数': opp_games,  # ← ここを追加しました！
-        '球場打席数': stad_pa,
-        '球場試合数': stad_games,  # ← 念のため球場試合数も追加
+        '対戦打席数': pa,
+        '対戦試合数': games,
         'note': note
     }
 
 
-def predict_all(re24, df_woba, league_avg, batter, opponent, *args, **kwargs):
-    """
-    24場面すべての予測結果をDataFrameにまとめて返す
-    """
-    stadium = "全体"
-    if len(args) == 1:
-        stadium = args[0]
-    elif 'stadium' in kwargs:
-        stadium = kwargs['stadium']
-
+def predict_all(re24, df_woba, league_avg, batter, opponent):
+    """24場面すべての予測結果をDataFrameにまとめて返す"""
     rows = []
     for out in [0, 1, 2]:
         for runner in RUNNER_LABEL:
-            res = predict_one(re24, df_woba, league_avg, batter, opponent, stadium, out, runner)
+            res = predict_one(re24, df_woba, league_avg, batter, opponent, out, runner)
             rows.append({
                 'アウト': out,
                 'ランナー': runner,
                 '打者wOBA': res['打者wOBA'],
                 '基礎RE24': res['基礎RE24'],
                 '補正後期待得点': res['補正後期待得点'],
-                '対戦打席数': res['対戦打席数'],
-                '対戦試合数': res['対戦試合数'],
-                '球場打席数': res['球場打席数'],
-                '球場試合数': res['球場試合数']
+                '対戦打席数': res['対戦打席数']
             })
     return pd.DataFrame(rows)
