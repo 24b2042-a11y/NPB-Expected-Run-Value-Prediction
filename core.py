@@ -105,9 +105,9 @@ def _opponent_team_raw(row, game_teams: dict) -> str | None:
     away_raw, home_raw = pair
     if '裏' in str(row.get('イニング', '')):
         # 裏＝ホームチームが打席 → 相手はアウェー
-        return away_raw
+        return home_raw
     # 表＝アウェーチームが打席 → 相手はホーム
-    return home_raw
+    return away_raw
 
 
 def add_result_columns(df_runs: pd.DataFrame) -> pd.DataFrame:
