@@ -101,7 +101,13 @@ def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     all_df['アウト']   = pd.to_numeric(all_df['アウト'],   errors='coerce').fillna(0).astype(int)
     all_df['打席順']  = pd.to_numeric(all_df['打席順'],  errors='coerce').fillna(0).astype(int)
     all_df['打順']    = pd.to_numeric(all_df['打順'],    errors='coerce')
-    all_df['ランナー'] = all_df['ランナー'].fillna('')
+    
+    # ★【修正】空文字や欠損値を、集計ラベルと一致する「走者なし」に完全統一する
+    all_df['ランナー'] = all_df['ランナー'].fillna('走者なし').replace({
+        '': '走者なし', 
+        'nan': '走者なし', 
+        'None': '走者なし'
+    })
     return all_df
 
 
