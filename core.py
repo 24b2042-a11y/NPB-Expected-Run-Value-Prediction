@@ -82,18 +82,31 @@ def classify_result(text) -> str:
     return 'UNKNOWN'
 
 
+# 試合開始前などに入る仮表示（プレースホルダー）のチーム名。
+# これらが拾われた場合はスキップし、実際の球団名が確定するまで探す。
+PLACEHOLDER_TEAM_NAMES = {
+    '対戦相手', '自チーム', 'ホーム', 'アウェー', 'ビジター', '相手チーム', 'VS',
+}
+
+
 def _extract_game_teams(df_runs: pd.DataFrame) -> dict:
     """
-    game_id ごとに (away_raw, home_raw) を本文のスコア表記から1回だけ確定する。
-    スコア表記は「アウェー 点-点 ホーム」の並びを想定。
+    game_id ごとに (away_raw, home_raw) を本文のスコア表記から確定する。
+    試合序盤にはプレースホルダー表記（「対戦相手」など）が入ることがあるため、
+    build_team_runs と同じ方針で「試合を逆順にたどって最初に見つかる有効な行
+    （＝試合終盤の確定スコア表記）」を採用する。
     """
     teams = {}
     for game_id, grp in df_runs.groupby('game_id'):
-        for body in grp['本文'].fillna(''):
+        for body in grp['本文'].fillna('').iloc[::-1]:
             m = TEAM_LINE_RE.search(str(body))
-            if m:
-                teams[game_id] = (m.group(1), m.group(4))
-                break
+            if not m:
+                continue
+            away_raw, home_raw = m.group(1), m.group(4)
+            if away_raw in PLACEHOLDER_TEAM_NAMES or home_raw in PLACEHOLDER_TEAM_NAMES:
+                continue
+            teams[game_id] = (away_raw, home_raw)
+            break
     return teams
 
 
