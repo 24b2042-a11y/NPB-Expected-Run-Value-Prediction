@@ -1,5 +1,5 @@
 """
-core.py — RE24 計算・予測ロジック（Streamlit / Colab 共通）- 完全修正版
+core.py — RE24 計算・予測ロジック（Streamlit / Colab 共通）- バグ修正版
 """
 import os
 import re
@@ -29,7 +29,7 @@ TEAM_NAME_MAP = [
 
 def normalize_team_name(raw: str | None) -> str | None:
     """カードの長い球団名を状況別データの区分名（短縮名）に変換する"""
-    if not raw or raw in ('対戦相手', '対戦球団', '相手球団'):
+    if not raw:
         return None
     s = unicodedata.normalize('NFKC', raw)
     for key, target in TEAM_NAME_MAP:
@@ -101,25 +101,21 @@ def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     all_df['アウト']   = pd.to_numeric(all_df['アウト'],   errors='coerce').fillna(0).astype(int)
     all_df['打席順']  = pd.to_numeric(all_df['打席順'],  errors='coerce').fillna(0).astype(int)
     all_df['打順']    = pd.to_numeric(all_df['打順'],    errors='coerce')
-    
-    # 空文字や欠損値を、集計用ラベルと一致する「走者なし」に統一して抜け漏れを防止
-    all_df['ランナー'] = all_df['ランナー'].fillna('走者なし').replace({
-        '': '走者なし', 
-        'nan': '走者なし', 
-        'None': '走者なし'
-    })
+    all_df['ランナー'] = all_df['ランナー'].fillna('')
     return all_df
 
 
 # ============================================================
-# Step 2: イニング順の正しいソート ＆ 残り得点の計算
+# Step 2: イニング順の正しいソート ＆ 残り得点の計算（バグ修正済）
 # ============================================================
 def sort_by_inning_correctly(df: pd.DataFrame) -> pd.DataFrame:
-    """イニング文字列（10回裏が2回表より前に来る辞書順バグ）を正しい時系列に並び替える"""
+    """イニング文字列（10回裏が2回表より前に来る辞書順バグ）を、正しい時系列に並び替える"""
     def parse_inning_str(s):
         s = str(s)
+        # イニングの数字を抽出
         num_m = re.search(r'\d+', s)
         num = int(num_m.group()) if num_m else 0
+        # 「表」なら0、「裏」なら1とし、表裏順も正しく揃える
         side = 0 if '表' in s else 1
         return (num, side)
     
@@ -151,7 +147,7 @@ def calc_runs_after(all_df: pd.DataFrame) -> pd.DataFrame:
     df['total_score'] = df.groupby('game_id')['total_score'].ffill().bfill().fillna(0).astype(int)
     df['total_score'] = df.groupby('game_id')['total_score'].cummax()
 
-    # 4. イニングごとに diff() を取り、イニングまたぎ・ゲーム初期スコア誤算入による高値バグを完璧に防止
+    # 4. 【修正点】イニングごとに diff() を取ることでイニングまたぎ・ゲーム初期スコア誤算入を完璧に防止
     df['runs_on_play'] = df.groupby(['game_id', 'イニング'])['total_score'].diff().fillna(0).astype(int)
     df['runs_on_play'] = df['runs_on_play'].clip(lower=0)
 
@@ -254,7 +250,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
 
     df_runs['選手名'] = df_runs.get('打者', df_runs.get('選手名', '')).fillna('')
 
-    # 2. RE24 計算時に「投手交代」「代打」などの打席を伴わないノイズイベントを完全排除
+    # 2. 【修正点】RE24 計算時に「投手交代」「代打」などの打席を伴わないノイズイベントを完全排除
     df_runs_for_re24 = df_runs[(df_runs['結果'] != 'UNKNOWN') & (df_runs['アウト'].isin([0, 1, 2]))]
 
     re24_pivot = df_runs_for_re24.pivot_table(index='アウト', columns='ランナー', values='runs_after', aggfunc='mean')
@@ -285,80 +281,24 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame | None
     woba_den = ab_sum + bb_sum + hbp_sum + sf_sum
     league_avg = woba_num / woba_den if woba_den > 0 else 0.315
 
-    # ============================================================
-    # 4. 【徹底修正】wOBA マッピング (「区分」と「区分名」の混同バグを完全回避)
-    # ============================================================
+    # 4. wOBA マッピング
     df_woba = pd.DataFrame(columns=['選手名', '区分名', '試合', '打席', 'wOBA'])
     if batter_df is not None and not batter_df.empty:
         col_map = {}
-        
-        # [Step 4-1] 最優先の厳密マッチ（本物の「名称」が入った列を狙い撃ち）
         for col in batter_df.columns:
-            if col in ['選手名', '選手']:
-                col_map[col] = '選手名'
-            elif col in ['区分名', '対戦相手', '対象', '球場名']:
-                col_map[col] = '区分名'
-            elif col in ['試合', '試合数']:
-                col_map[col] = '試合'
-            elif col in ['打席', '打席数']:
-                col_map[col] = '打席'
-            elif col.lower() == 'woba':
-                col_map[col] = 'wOBA'
+            if '選手' in col: col_map[col] = '選手名'
+            elif '区分' in col or '対戦' in col or '球場' in col: col_map[col] = '区分名'
+            elif '試合' in col: col_map[col] = '試合'
+            elif '打席' in col: col_map[col] = '打席'
+            elif 'wOBA' in col or 'woba' in col: col_map[col] = 'wOBA'
 
-        # [Step 4-2] 漏れた列に対するフォールバック（部分一致）
-        mapped_targets = set(col_map.values())
-        for col in batter_df.columns:
-            if col in col_map:
-                continue
-            
-            if '選手' in col and '選手名' not in mapped_targets:
-                col_map[col] = '選手名'
-                mapped_targets.add('選手名')
-            elif 'woba' in col.lower() and 'wOBA' not in mapped_targets:
-                col_map[col] = 'wOBA'
-                mapped_targets.add('wOBA')
-            elif '打席' in col and '打席' not in mapped_targets:
-                col_map[col] = '打席'
-                mapped_targets.add('打席')
-            elif '試合' in col and '試合' not in mapped_targets:
-                col_map[col] = '試合'
-                mapped_targets.add('試合')
-            elif col == '区分':
-                # 単なる「区分」という列名は、「対戦相手」等の固定ラベル列である確率が高いため、一旦別扱いに退避
-                col_map[col] = '区分タイプ'
-            elif ('区分' in col or '対戦' in col or '球場' in col) and '区分名' not in mapped_targets:
-                col_map[col] = '区分名'
-                mapped_targets.add('区分名')
-
-        # [Step 4-3] 安全弁: 「区分名」が最後まで抽出できず「区分タイプ」だけがある場合のみ昇格
-        if '区分名' not in col_map.values():
-            for k, v in list(col_map.items()):
-                if v == '区分タイプ':
-                    col_map[k] = '区分名'
-
-        # リネームの実行と重複カラムの物理的削除
-        df_renamed = batter_df.rename(columns=col_map)
-        df_renamed = df_renamed.loc[:, ~df_renamed.columns.duplicated()]
-
-        # 不足しているカラムを安全なデフォルト値で補完
+        df_woba = batter_df.rename(columns=col_map)
         for col in ['選手名', '区分名', '試合', '打席', 'wOBA']:
-            if col not in df_renamed.columns:
-                if col in ['試合', '打席']:
-                    df_renamed[col] = 0
-                elif col == 'wOBA':
-                    df_renamed[col] = league_avg
-                else:
-                    df_renamed[col] = ''
-
-        # 5カラムを確実に抽出
-        df_woba = df_renamed[['選手名', '区分名', '試合', '打席', 'wOBA']].copy()
-
-        # [Step 4-4] ヘッダー行などの不要データをパージ
-        invalid_values = {'対戦相手', '区分名', '選手名', '選手', '区分', '対戦', 'wOBA', 'woba'}
-        df_woba = df_woba[
-            ~df_woba['区分名'].astype(str).str.strip().isin(invalid_values) &
-            ~df_woba['選手名'].astype(str).str.strip().isin(invalid_values)
-        ]
+            if col not in df_woba.columns:
+                if col in ['試合', '打席']: df_woba[col] = 0
+                elif col == 'wOBA': df_woba[col] = league_avg
+                else: df_woba[col] = ''
+        df_woba = df_woba[['選手名', '区分名', '試合', '打席', 'wOBA']].copy()
 
     n_games = all_df['game_id'].nunique()
     n_pa = len(all_df)
