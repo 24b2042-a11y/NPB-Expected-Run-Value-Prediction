@@ -152,42 +152,69 @@ def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
 # ============================================================
 # Step 2: イニング残り得点を付与
 # ============================================================
+def _inning_sort_key(inning_str) -> tuple[int, int]:
+    """
+    'イニング' 列（例: '1回表', '5回裏'）を試合内の時系列順に並べるための
+    ソートキーを返す。(イニング番号, 表=0/裏=1)
+    """
+    s = str(inning_str)
+    m = re.search(r'(\d+)', s)
+    num = int(m.group(1)) if m else 0
+    tb = 1 if '裏' in s else 0
+    return (num, tb)
+
+
 def calc_runs_after(all_df: pd.DataFrame) -> pd.DataFrame:
     results = []
-    for (game_id, inning), grp in all_df.groupby(['game_id', 'イニング']):
-        grp = grp.sort_values('打席順').reset_index(drop=True)
+    for game_id, game_grp in all_df.groupby('game_id'):
+        # 半イニングを試合内の時系列順（イニング番号→表/裏）に並べる。
+        # 得点の累計（carry_score）をイニングをまたいで引き継ぐために、
+        # 出現順ではなく明示的に時系列でソートする必要がある。
+        inning_order = sorted(game_grp['イニング'].unique(), key=_inning_sort_key)
 
-        score_after, last_score = [None] * len(grp), None
-        for i, body in enumerate(grp['本文'].fillna('')):
-            m = RE_SCORE.search(str(body))
-            if m:
-                last_score = int(m.group(1)) + int(m.group(2))
-            score_after[i] = last_score
+        carry_score = 0  # この試合でそれまでに記録された総得点（両チーム合計）
+        for inning in inning_order:
+            grp = game_grp[game_grp['イニング'] == inning].sort_values('打席順').reset_index(drop=True)
 
-        delta, prev = [], 0
-        for s in score_after:
-            cur = s if s is not None else prev
-            delta.append(cur - prev)
-            prev = cur
+            score_after, last_score = [None] * len(grp), None
+            for i, body in enumerate(grp['本文'].fillna('')):
+                m = RE_SCORE.search(str(body))
+                if m:
+                    last_score = int(m.group(1)) + int(m.group(2))
+                score_after[i] = last_score
 
-        suffix = np.cumsum(delta[::-1])[::-1]
+            # このイニング開始前の得点（carry_score）を起点に増分（delta）を求める。
+            # 以前は各イニングの起点を常に 0 としていたため、そのイニングの
+            # 先頭打者（＝必ず 0アウト・走者なしの場面）に、それ以前の試合の
+            # 総得点がまるごと加算されてしまい、RE24（特に 0アウト・走者なし）
+            # の値が異常に高くなる不具合があった。
+            delta, prev = [], carry_score
+            for s in score_after:
+                cur = s if s is not None else prev
+                delta.append(cur - prev)
+                prev = cur
 
-        home_raw = grp['home_team_raw'].iloc[0] if 'home_team_raw' in grp.columns else None
-        away_raw = grp['away_team_raw'].iloc[0] if 'away_team_raw' in grp.columns else None
+            suffix = np.cumsum(delta[::-1])[::-1]
 
-        for i, (_, row) in enumerate(grp.iterrows()):
-            results.append({
-                'game_id':       game_id,
-                'イニング':      inning,
-                '打席順':        row['打席順'],
-                '選手名':        row['選手名'],
-                'アウト':        row['アウト'],
-                'ランナー':      row['ランナー'],
-                '本文':          row['本文'],
-                'runs_after':    int(suffix[i]),
-                'home_team_raw': home_raw,
-                'away_team_raw': away_raw,
-            })
+            # 次の半イニングの起点用に、このイニングの最終得点を引き継ぐ
+            carry_score = prev
+
+            home_raw = grp['home_team_raw'].iloc[0] if 'home_team_raw' in grp.columns else None
+            away_raw = grp['away_team_raw'].iloc[0] if 'away_team_raw' in grp.columns else None
+
+            for i, (_, row) in enumerate(grp.iterrows()):
+                results.append({
+                    'game_id':       game_id,
+                    'イニング':      inning,
+                    '打席順':        row['打席順'],
+                    '選手名':        row['選手名'],
+                    'アウト':        row['アウト'],
+                    'ランナー':      row['ランナー'],
+                    '本文':          row['本文'],
+                    'runs_after':    int(suffix[i]),
+                    'home_team_raw': home_raw,
+                    'away_team_raw': away_raw,
+                })
     return pd.DataFrame(results)
 
 
