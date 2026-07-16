@@ -14,11 +14,17 @@ import plotly.express as px
 from core import (
     build_model_from_dfs, predict_one, predict_all,
     get_player_career, get_player_current_team, get_team_avg_runs,
+    normalize_name,
     RUNNER_LABEL, RUNNER_MAP,
 )
 # build_model_from_dfs の戻り値に df_team_batting_stats（対戦球団ごとの
 # 打率・得点期待値）と df_situational_stats（状況別の打率・得点期待値）が
 # 追加されたのに合わせて main() 側の unpack と page_main() の引数を拡張。
+#
+# 実測データ（df_team_batting_stats）を選手名で突き合わせる際は、必ず
+# core.normalize_name() で正規化してから比較する。単純な文字列一致だと、
+# 表記ゆれ（全角/半角、空白、中黒など）で「対戦データ（nf3）はあるのに
+# 実測データが表示されない」という不具合が起きるため。
 from scraper import scrape_games
 from github_sync import (
     commit_game_files,
@@ -154,6 +160,20 @@ def plot_career_trend(df_career):
 
 
 # ============================================================
+# 実測データ（df_team_batting_stats）を選手名で絞り込むヘルパー
+#   単純な文字列一致だと、全角/半角・空白・中黒などの表記ゆれで
+#   「対戦データ（nf3）はあるのに実測データが出ない」不具合が起きるため、
+#   必ず normalize_name() で正規化してから比較する。
+# ============================================================
+def filter_team_batting_stats_by_batter(df_team_batting_stats: pd.DataFrame, batter: str) -> pd.DataFrame:
+    if df_team_batting_stats.empty:
+        return df_team_batting_stats
+    batter_key = normalize_name(batter)
+    name_keys  = df_team_batting_stats['選手名'].apply(normalize_name)
+    return df_team_batting_stats[name_keys == batter_key]
+
+
+# ============================================================
 # メインページ: 得点期待値予測 + 選手個人成績
 # ============================================================
 def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
@@ -230,10 +250,8 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     st.caption(f"リーグ平均 wOBA: {league_avg:.3f}")
 
     # ---- 対戦球団ごとの実測打率・得点期待値（状況別ではない） ----
-    row = df_team_batting_stats[
-        (df_team_batting_stats['選手名'] == batter) &
-        (df_team_batting_stats['対戦球団'] == opponent)
-    ]
+    row = filter_team_batting_stats_by_batter(df_team_batting_stats, batter)
+    row = row[row['対戦球団'] == opponent]
     if not row.empty:
         r = row.iloc[0]
         e1, e2, e3 = st.columns(3)
@@ -311,7 +329,7 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
             st.dataframe(df_b, use_container_width=True)
 
     with tab_real:
-        df_r = (df_team_batting_stats[df_team_batting_stats['選手名'] == batter]
+        df_r = (filter_team_batting_stats_by_batter(df_team_batting_stats, batter)
                 [['対戦球団','打席','打数','安打','打率','得点期待値']]
                 .sort_values('得点期待値', ascending=False))
         if df_r.empty:
