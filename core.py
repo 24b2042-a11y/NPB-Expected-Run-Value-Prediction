@@ -520,14 +520,30 @@ def load_career_stats(stats_dir: str) -> pd.DataFrame:
     for f in files:
         try:
             df = pd.read_csv(f, encoding='utf-8-sig')
-            dfs.append(df)
         except Exception:
             continue
+
+        # ファイル名（例: stats_2024.csv）から年度を推定しておく。
+        # CSV内の '年度' 列が欠落している、または一部の行だけ空になっている
+        # ケースがあり、それをそのまま結合すると該当年の '年度' が NaN のまま
+        # （画面上は None）表示されてしまうため、ファイル名側の年度で補完する。
+        m = re.search(r'(\d{4})', os.path.basename(f))
+        file_year = int(m.group(1)) if m else None
+
+        if '年度' not in df.columns:
+            df['年度'] = file_year
+        else:
+            df['年度'] = pd.to_numeric(df['年度'], errors='coerce')
+            if file_year is not None:
+                df['年度'] = df['年度'].fillna(file_year)
+
+        dfs.append(df)
 
     if not dfs:
         return pd.DataFrame()
 
     all_stats = pd.concat(dfs, ignore_index=True)
+    all_stats['年度'] = all_stats['年度'].astype('Int64')
     all_stats['選手名_key'] = all_stats['選手名'].apply(normalize_name)
     all_stats['OPS'] = all_stats['出塁率'] + all_stats['長打率']
     return all_stats
