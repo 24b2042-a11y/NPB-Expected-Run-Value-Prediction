@@ -545,11 +545,16 @@ def page_settings(gh_cfg):
 
         failed_teams   = df_pitchers.attrs.get('failed_teams', [])
         failed_players = df_pitchers.attrs.get('failed_players', [])
+        fail_errors    = df_pitchers.attrs.get('errors', [])
         if failed_teams:
             st.warning(f'取得できなかった球団: {", ".join(failed_teams)}')
         if failed_players:
             with st.expander(f'個別ページを取得できなかった投手（{len(failed_players)} 人・通算成績のみ保存）'):
                 st.write('、'.join(failed_players))
+        if fail_errors:
+            with st.expander('失敗の理由（原因調査用）', expanded=df_pitchers.empty):
+                for msg in fail_errors:
+                    st.text(msg)
 
         if df_pitchers.empty:
             st.error(
