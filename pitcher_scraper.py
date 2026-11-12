@@ -36,7 +36,8 @@ import requests
 
 from core import normalize_name, normalize_team_name
 
-BASE_URL = 'https://nf3.sakura.ne.jp/php/stat_disp/stat_disp.php'
+SITE_ROOT = 'https://nf3.sakura.ne.jp/'
+BASE_URL = SITE_ROOT + 'php/stat_disp/stat_disp.php'
 HEADERS  = {'User-Agent': 'Mozilla/5.0 (academic research; NPB sabermetrics)'}
 
 # (leg, nf3の球団コード, 球団名, リーグ名)
@@ -186,9 +187,23 @@ def _row_texts(row, width: int) -> list[str]:
 # ============================================================
 # 1. 球団ページ: 全投手の一覧（通算成績 + 個別ページのURL）
 # ============================================================
+def _link_base(html: str, page_url: str) -> str:
+    """
+    相対リンクを解決する基準URLを返す。
+    nf3 のページは <base href="https://nf3.sakura.ne.jp/"> を持ち、リンクは
+    「Central/T/p/13_stat.htm」のようにそのベース基準の相対パスで書かれている。
+    ページ自身のURL（/php/stat_disp/ 配下）を基準につなぐと存在しない
+    /php/stat_disp/Central/... になり 404 になるため、<base> があればそれを使い、
+    無い場合もサイトのルートを基準にする。
+    """
+    m = re.search(r'<base\b[^>]*\bhref\s*=\s*["\']([^"\']+)["\']', html, flags=re.I)
+    return urljoin(page_url, m.group(1)) if m else SITE_ROOT
+
+
 def _fetch_team_roster(leg: int, code: str) -> pd.DataFrame:
     resp = _get(BASE_URL, {'y': 0, 'leg': leg, 'tm': code, 'fp': 1, 'dn': 1, 'dk': 0})
     tables = _parse_tables(resp.text)
+    link_base = _link_base(resp.text, resp.url)
 
     for rows in tables:
         for i, row in enumerate(rows):
@@ -202,7 +217,7 @@ def _fetch_team_roster(leg: int, code: str) -> pd.DataFrame:
                         continue  # 末尾に再掲される見出し行
                     rec = dict(zip(header, texts))
                     href = r[name_idx][1] if name_idx < len(r) else None
-                    rec['href'] = urljoin(resp.url, href) if href else None
+                    rec['href'] = urljoin(link_base, href) if href else None
                     records.append(rec)
                 if not records:
                     raise ValueError('投手一覧の表はあるが、データ行が0件')
