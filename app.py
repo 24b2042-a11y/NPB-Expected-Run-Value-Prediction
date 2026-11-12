@@ -32,8 +32,10 @@ from github_sync import (
     get_existing_game_ids,
     save_batter_csv_to_github,
     load_batter_csv_from_github,
+    save_pitcher_csv_to_github,
 )
 from batter_scraper import scrape_all_batters
+from pitcher_scraper import scrape_all_pitchers
 
 st.set_page_config(
     page_title='NPB 得点期待値予測',
@@ -472,6 +474,7 @@ def page_settings(gh_cfg):
     st.markdown(
         f'- 打席イベント: GitHub `data/gamedata/*_details.csv`\n'
         f'- 状況別打者成績: `data/all_batters_situational.csv`\n'
+        f'- 投手成績: `data/all_pitchers.csv`\n'
         f'- 過去3年成績: `data/2023~2025打撃データ/stats_YYYY.csv`'
     )
 
@@ -513,6 +516,50 @@ def page_settings(gh_cfg):
                 st.success(f'✅ GitHub に保存しました: {msg}')
                 st.info('データキャッシュをクリアして再計算します...')
                 reload_model()
+            else:
+                st.error(f'GitHub への保存に失敗しました: {msg}')
+
+    st.divider()
+    st.subheader('⚾ 投手成績データの更新')
+    st.caption(
+        'nf3.sakura.ne.jp からセ・パ・交流戦の投手成績（投球回・被安打・三振・四球など）を取得し、'
+        'GitHub の `data/all_pitchers.csv` を更新します。リーグ単位の一覧表なので数秒で終わります。'
+    )
+    pitcher_sleep = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 1.5, 0.5, key='pitcher_sleep')
+
+    if st.button('🔄 投手成績データを更新', type='secondary'):
+        p_bar = st.progress(0, text='準備中...')
+
+        def on_pitcher_progress(i, total, league_name):
+            p_bar.progress(i / total, text=f'[{i + 1}/{total}] {league_name} を取得中')
+
+        with st.spinner('投手データを取得中...'):
+            df_pitchers = scrape_all_pitchers(
+                sleep_sec=pitcher_sleep, on_progress=on_pitcher_progress,
+            )
+        p_bar.progress(1.0, text='取得完了')
+
+        if df_pitchers.empty:
+            st.error(
+                'データを取得できませんでした。サイト構造が変わっている、'
+                'またはアクセスが制限されている可能性があります。'
+            )
+        else:
+            n_p = df_pitchers['選手名'].nunique()
+            st.success(f'✅ {n_p} 投手分・{len(df_pitchers):,} 行のデータを取得しました。')
+            st.dataframe(
+                df_pitchers[['選手名', '球団', '腕', 'リーグ', '投球回', '被打者',
+                             'K%', 'BB%', 'FIP', '防御率']].round(3).head(20),
+                use_container_width=True,
+            )
+
+            with st.spinner('GitHub に保存中...'):
+                ok, msg = save_pitcher_csv_to_github(
+                    gh_cfg['token'], gh_cfg['repo_name'], df_pitchers, gh_cfg['branch']
+                )
+
+            if ok:
+                st.success(f'✅ GitHub に保存しました: {msg}')
             else:
                 st.error(f'GitHub への保存に失敗しました: {msg}')
 
