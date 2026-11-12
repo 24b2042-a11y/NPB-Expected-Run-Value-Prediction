@@ -1,44 +1,68 @@
 """
-pitcher_scraper.py — nf3.sakura.ne.jp から投手成績（セ・パ・交流戦）を取得する
+pitcher_scraper.py — nf3.sakura.ne.jp から全投手の成績を取得する
 
-取得元: 「投手成績一覧 総合成績」ページ
-  https://nf3.sakura.ne.jp/php/stat_disp/stat_disp.php?y=0&leg={0|1|2}&tm=Sta&fp=1&dn=6&dk=0
-  leg=0: セ・リーグ / leg=1: パ・リーグ / leg=2: 交流戦
-  （y=0 は当年度。過去年度の指定方法は未確認）
+打者のスクレイパー（batter_scraper.py）と同じ流れで取得する:
+  1. 球団ごとの「投手成績一覧（背番号順）」ページから、その球団の全投手と
+     各投手の個別ページへのリンクを取得する
+       https://nf3.sakura.ne.jp/php/stat_disp/stat_disp.php?y=0&leg={0|1}&tm={球団コード}&fp=1&dn=1&dk=0
+  2. 投手ごとの個別ページ（例: /Central/G/p/11_stat.htm）から、
+     対戦相手別（チーム）・球場別の成績表を取得する
 
-打者のスクレイパー（1選手ずつ取得）と違い、リーグ単位の一覧表を
-1回で取れるため、リクエストは最大3回で済む。
+出力は打者のCSV（all_batters_situational.csv）に合わせた縦持ちの形式:
+  区分種別 = '通算' / '対戦相手' / '球場'
+  区分名   = 通算なら '全体'、対戦相手なら球団名（core.normalize_team_name で統一）、
+             球場なら球場名
 
-取得できる主な列:
-  名前, TM(球団コード), 腕, 防御率, 試合, 先発, 救援, 回数, 被打者, 被安, 被本,
-  三振, 四球, 故意四, 死球, 失点, 自責 など
-
-注意: 二塁打・三塁打の被弾数は無いため、被wOBAは厳密には計算できない。
-      代わりに K% / BB% / HR/9 / FIP を算出する。
+注意:
+  ・二塁打・三塁打の被弾数は無いため、被wOBAは厳密には計算できない。
+    代わりに K% / BB% / HR/9 / FIP を算出する。
+  ・対戦相手別・球場別の表には「被打者」が無いため、
+    被打者 ≒ 3 × 投球回 + 被安 + 四球 + 死球 で推定する（'被打者_推定' = True）。
+  ・個別ページの表のレイアウトは実サイトで未確認。表が見つからない投手は
+    df.attrs['failed_players'] に入れてスキップする。
 """
 import io
 import re
 import time
+from functools import reduce
+from urllib.parse import urljoin
 
 import pandas as pd
 import requests
 
-from core import normalize_name
+from core import normalize_name, normalize_team_name
 
 BASE_URL = 'https://nf3.sakura.ne.jp/php/stat_disp/stat_disp.php'
-LEAGUES  = {0: 'セ・リーグ', 1: 'パ・リーグ', 2: '交流戦'}
 HEADERS  = {'User-Agent': 'Mozilla/5.0 (academic research; NPB sabermetrics)'}
 
-# nf3 の球団コード → 球団名（core.normalize_team_name で突き合わせ可能な表記）
-TM_CODE_TO_TEAM = {
-    'T': '阪神', 'DB': 'DeNA', 'G': '読売', 'D': '中日', 'C': '広島', 'S': 'ヤクルト',
-    'H': 'ソフトバンク', 'F': '日本ハム', 'B': 'オリックス', 'E': '楽天',
-    'L': '西武', 'M': 'ロッテ',
-}
+# (leg, nf3の球団コード, 球団名, リーグ名)
+TEAMS = [
+    (0, 'T',  '阪神',         'セ・リーグ'),
+    (0, 'DB', 'DeNA',         'セ・リーグ'),
+    (0, 'G',  '読売',         'セ・リーグ'),
+    (0, 'D',  '中日',         'セ・リーグ'),
+    (0, 'C',  '広島',         'セ・リーグ'),
+    (0, 'S',  'ヤクルト',     'セ・リーグ'),
+    (1, 'H',  'ソフトバンク', 'パ・リーグ'),
+    (1, 'F',  '日本ハム',     'パ・リーグ'),
+    (1, 'B',  'オリックス',   'パ・リーグ'),
+    (1, 'E',  '楽天',         'パ・リーグ'),
+    (1, 'L',  '西武',         'パ・リーグ'),
+    (1, 'M',  'ロッテ',       'パ・リーグ'),
+]
 
-TEXT_COLS = {'名前', 'TM', '腕'}
+ROSTER_TEXT_COLS = {'背番', '名前', '腕', '最終登板'}
+
+# 個別ページ内の表の先頭列の見出し → 区分種別
+SPLIT_KEYS = {'チーム': '対戦相手', '球場': '球場'}
+
+STAT_COLS = ['試合', '先発', '救援', '投球回', '被安', '被本', '三振', '四球', '死球',
+             '失点', '自責', '防御率']
 
 
+# ============================================================
+# 共通ユーティリティ
+# ============================================================
 def _ip_to_float(x) -> float:
     """
     投球回の表記（180.1 = 180と1/3回）を実数の回数に直す。
@@ -53,48 +77,160 @@ def _ip_to_float(x) -> float:
     return whole + tenth / 3.0
 
 
-def _fetch_league_table(leg: int, y: int = 0) -> pd.DataFrame:
-    resp = requests.get(
-        BASE_URL,
-        params={'y': y, 'leg': leg, 'tm': 'Sta', 'fp': 1, 'dn': 6, 'dk': 0},
-        headers=HEADERS, timeout=30,
-    )
+def _get(url: str, params: dict | None = None) -> requests.Response:
+    resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
     resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding or 'utf-8'
+    # nf3 は UTF-8。ヘッダーに charset が無い場合に ISO-8859-1 と誤判定されないようにする
+    if resp.encoding is None or resp.encoding.lower() == 'iso-8859-1':
+        resp.encoding = 'utf-8'
+    return resp
 
-    # 「被打者」を含むテーブル（= 投手成績一覧）だけを拾う
-    tables = pd.read_html(io.StringIO(resp.text), match='被打者')
-    df = tables[0]
-    df.columns = [re.sub(r'\s', '', str(c)) for c in df.columns]
+
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """列名の空白を除き、MultiIndex（見出しが2段）の場合は '/' でつないで1段にする"""
+    cols = []
+    for c in df.columns:
+        if isinstance(c, tuple):
+            parts = []
+            for p in c:
+                p = re.sub(r'\s', '', str(p))
+                if p and not p.startswith('Unnamed') and p not in parts:
+                    parts.append(p)
+            cols.append('/'.join(parts))
+        else:
+            cols.append(re.sub(r'\s', '', str(c)))
+    df = df.copy()
+    df.columns = cols
     return df
 
 
-def _clean_table(df: pd.DataFrame, league_name: str) -> pd.DataFrame:
-    # 表の末尾に見出し行が再掲されているので除外
-    df = df[df['名前'] != '名前'].copy()
-    df = df[df['名前'].notna()]
+# ============================================================
+# 1. 球団ページ: 全投手の一覧（通算成績 + 個別ページのURL）
+# ============================================================
+def _fetch_team_roster(leg: int, code: str) -> pd.DataFrame:
+    resp = _get(BASE_URL, {'y': 0, 'leg': leg, 'tm': code, 'fp': 1, 'dn': 1, 'dk': 0})
+
+    # extract_links='body' でセルが (テキスト, href) のタプルになる
+    tables = pd.read_html(io.StringIO(resp.text), match='被打者', extract_links='body')
+    df = _flatten_columns(tables[0])
+
+    def _text(v):
+        return v[0] if isinstance(v, tuple) else v
+
+    def _href(v):
+        # リンクのないセル（「合計」行など）は None か NaN になるので、文字列のときだけ使う
+        h = v[1] if isinstance(v, tuple) else None
+        return urljoin(resp.url, h) if isinstance(h, str) and h else None
+
+    href = df['名前'].map(_href)
+    df = df.apply(lambda col: col.map(_text))
+    df['href'] = href
+    return df
+
+
+def _clean_roster(df: pd.DataFrame) -> pd.DataFrame:
+    # 名前が空の行（先頭の「合計」行など）と、末尾に再掲される見出し行を除く
+    df = df[df['名前'].notna()].copy()
+    df = df[df['名前'].astype(str).str.strip() != '']
+    df = df[df['名前'] != '名前']
+    df = df[df['背番'].astype(str) != '合計']
 
     for c in df.columns:
-        if c not in TEXT_COLS:
+        if c not in ROSTER_TEXT_COLS and c != 'href':
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-    df = df.rename(columns={'名前': '選手名', '回数': '投球回_表記'})
-    df['選手名']     = df['選手名'].astype(str).str.strip()
-    df['選手名_key'] = df['選手名'].apply(normalize_name)
-    df['球団']       = df['TM'].map(TM_CODE_TO_TEAM)
-    df['リーグ']     = league_name
-    df['投球回']     = df['投球回_表記'].apply(_ip_to_float)
+    # 登板がなく成績が空の行は除く
+    df = df[df['被打者'].notna()].copy()
+    df['名前'] = df['名前'].astype(str).str.strip()
     return df.reset_index(drop=True)
 
 
+def _roster_total_row(r: pd.Series) -> dict:
+    """球団ページの1行（通算成績）を、縦持ち形式の1行にする"""
+    row = {
+        '区分種別': '通算', '区分名': '全体',
+        '試合': r.get('試合'), '先発': r.get('先発'), '救援': r.get('救援'),
+        '投球回': _ip_to_float(r.get('回数')),
+        '被安': r.get('被安'), '被本': r.get('被本'), '三振': r.get('三振'),
+        '四球': r.get('四球'), '死球': r.get('死球'),
+        '失点': r.get('失点'), '自責': r.get('自責'), '防御率': r.get('防御率'),
+        '被打者': r.get('被打者'), '被打者_推定': False,
+    }
+    if '故意四' in r.index:
+        row['故意四'] = r.get('故意四')
+    return row
+
+
+# ============================================================
+# 2. 投手個別ページ: 対戦相手別・球場別
+# ============================================================
+def _parse_split_tables(html: str) -> list[dict]:
+    """
+    個別ページから「チーム」「球場」で始まる表を探し、縦持ちの行リストにする。
+    同じ見出しの表が複数に分かれている場合（打者ページの2ブロック構造と同様）は、
+    先頭列をキーに横結合する。
+    """
+    tables = pd.read_html(io.StringIO(html))
+
+    groups: dict[str, list[pd.DataFrame]] = {}
+    for t in tables:
+        t = _flatten_columns(t)
+        if len(t.columns) == 0:
+            continue
+        first = t.columns[0]
+        if first in SPLIT_KEYS:
+            groups.setdefault(first, []).append(t)
+
+    rows: list[dict] = []
+    for first, tabs in groups.items():
+        def _merge(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+            extra = [c for c in b.columns if c not in a.columns]
+            return a.merge(b[[first] + extra], on=first, how='left')
+
+        merged = reduce(_merge, tabs)
+        if '被安' not in merged.columns or '回数' not in merged.columns:
+            continue
+
+        for c in merged.columns:
+            if c != first:
+                merged[c] = pd.to_numeric(merged[c], errors='coerce')
+
+        for _, r in merged.iterrows():
+            name = str(r[first]).strip()
+            if not name or name in ('nan', '合計', '計', '通算', first):
+                continue
+
+            ip = _ip_to_float(r.get('回数'))
+            h, bb, hbp = r.get('被安'), r.get('四球'), r.get('死球')
+            if pd.isna(ip) or (ip == 0 and (pd.isna(h) or (h + bb + hbp) == 0)):
+                continue  # 登板なし
+
+            kind = SPLIT_KEYS[first]
+            row = {
+                '区分種別': kind,
+                '区分名': normalize_team_name(name) if kind == '対戦相手' else name,
+                '試合': r.get('試合'), '先発': r.get('先発'), '救援': r.get('救援'),
+                '投球回': ip, '被安': h, '被本': r.get('被本'), '三振': r.get('三振'),
+                '四球': bb, '死球': hbp, '失点': r.get('失点'), '自責': r.get('自責'),
+                '防御率': r.get('防御率'),
+                '被打者': 3 * ip + h + bb + hbp, '被打者_推定': True,
+            }
+            rows.append(row)
+    return rows
+
+
+# ============================================================
+# 指標
+# ============================================================
 def add_pitcher_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """
-    K% / BB% / HR/9 / FIP を追加する。
+    K% / BB% / HR/9 / WHIP / FIP を追加する。
 
     FIP = (13*被本 + 3*(四球 + 死球) - 2*三振) / 投球回 + 定数
     定数 = リーグ防御率 - (13*HR + 3*(BB+HBP) - 2*K)/IP
-           （取得した全投手の合計から求め、FIPの平均が防御率と揃うようにする）
-    四球は故意四球を除いた数（nf3の「四球」は故意四球を含む前提）。
+           （全投手の「通算」行の合計から求め、FIPの平均が防御率と揃うようにする）
+    FIP の四球は故意四球を除く（通算行のみ故意四球が分かる。
+    対戦相手別・球場別の行は四球をそのまま使う）。
     """
     df = df.copy()
     ibb = df['故意四'].fillna(0) if '故意四' in df.columns else 0
@@ -103,13 +239,15 @@ def add_pitcher_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df['K%']   = df['三振'] / df['被打者']
     df['BB%']  = df['四球'] / df['被打者']
     df['HR/9'] = df['被本'] * 9 / df['投球回']
+    df['WHIP'] = (df['被安'] + df['四球']) / df['投球回']
 
-    raw = (13 * df['被本'] + 3 * (bb_unint + df['死球']) - 2 * df['三振'])
+    raw = 13 * df['被本'] + 3 * (bb_unint + df['死球']) - 2 * df['三振']
 
-    ip_total = df['投球回'].sum()
+    tot = df['区分種別'] == '通算'
+    ip_total = df.loc[tot, '投球回'].sum()
     if ip_total and ip_total > 0:
-        lg_era   = 9 * df['自責'].sum() / ip_total
-        lg_core  = raw.sum() / ip_total
+        lg_era    = 9 * df.loc[tot, '自責'].sum() / ip_total
+        lg_core   = raw[tot].sum() / ip_total
         fip_const = lg_era - lg_core
     else:
         fip_const = 3.1  # フォールバック（一般的な目安）
@@ -118,35 +256,80 @@ def add_pitcher_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ============================================================
+# メイン: 球団 → 投手 → 個別ページ
+# ============================================================
 def scrape_all_pitchers(
     sleep_sec: float = 1.5,
-    y: int = 0,
     min_ip: float = 0.0,
     on_progress=None,
 ) -> pd.DataFrame:
     """
-    セ・パ・交流戦の投手成績を取得して結合する。
+    12球団の全投手について、通算・対戦相手別・球場別の成績を取得して結合する。
 
-    on_progress(i, total, league_name) を渡すと進捗を通知する。
-    取得できなかったリーグはスキップし、全て失敗した場合は空の
-    DataFrame を返す。
+    on_progress(ti, n_teams, team_name, pi, n_players, player_name) は
+    scrape_all_batters と同じ形式。
+
+    取得に失敗した球団・投手は飛ばし、df.attrs['failed_teams'] /
+    df.attrs['failed_players'] に記録する。
+    min_ip を指定すると、通算の投球回がそれ未満の投手を除く。
     """
-    frames = []
-    for i, (leg, league_name) in enumerate(LEAGUES.items()):
-        if on_progress:
-            on_progress(i, len(LEAGUES), league_name)
+    all_rows: list[dict] = []
+    failed_teams: list[str] = []
+    failed_players: list[str] = []
+    n_teams = len(TEAMS)
+
+    for ti, (leg, code, team_raw, league_name) in enumerate(TEAMS):
+        team = normalize_team_name(team_raw)
+
         try:
-            raw = _fetch_league_table(leg, y=y)
-            frames.append(_clean_table(raw, league_name))
+            roster = _clean_roster(_fetch_team_roster(leg, code))
         except Exception:
-            pass
-        time.sleep(sleep_sec)
+            failed_teams.append(team)
+            time.sleep(sleep_sec)
+            continue
 
-    if not frames:
-        return pd.DataFrame()
+        n_players = len(roster)
+        for pi, (_, r) in enumerate(roster.iterrows()):
+            pname = r['名前']
+            if on_progress:
+                on_progress(ti, n_teams, team, pi, n_players, pname)
 
-    df = pd.concat(frames, ignore_index=True)
+            base = {
+                '選手名': pname, '選手名_key': normalize_name(pname),
+                '背番': r.get('背番'), '腕': r.get('腕'),
+                'TM': code, '球団': team, 'リーグ': league_name,
+            }
+            all_rows.append({**base, **_roster_total_row(r)})
+
+            href = r.get('href')
+            if href:
+                try:
+                    html = _get(href).text
+                    for sp in _parse_split_tables(html):
+                        all_rows.append({**base, **sp})
+                except Exception:
+                    failed_players.append(f'{team} {pname}')
+                time.sleep(sleep_sec)
+            else:
+                failed_players.append(f'{team} {pname}')
+
+    if not all_rows:
+        out = pd.DataFrame()
+        out.attrs['failed_teams'] = failed_teams
+        out.attrs['failed_players'] = failed_players
+        return out
+
+    df = pd.DataFrame(all_rows)
     df = add_pitcher_metrics(df)
+
     if min_ip > 0:
-        df = df[df['投球回'] >= min_ip].reset_index(drop=True)
+        tot = df[df['区分種別'] == '通算']
+        keep = set(zip(tot.loc[tot['投球回'] >= min_ip, '選手名_key'],
+                       tot.loc[tot['投球回'] >= min_ip, 'TM']))
+        mask = [(k, t) in keep for k, t in zip(df['選手名_key'], df['TM'])]
+        df = df[mask].reset_index(drop=True)
+
+    df.attrs['failed_teams'] = failed_teams
+    df.attrs['failed_players'] = failed_players
     return df
