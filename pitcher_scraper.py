@@ -13,18 +13,22 @@ pitcher_scraper.py — nf3.sakura.ne.jp から全投手の成績を取得する
   区分名   = 通算なら '全体'、対戦相手なら球団名（core.normalize_team_name で統一）、
              球場なら球場名
 
+HTMLの表は標準ライブラリ（html.parser）だけで読む。pandas.read_html は
+lxml の有無・pandas のバージョン・入れ子のレイアウト用テーブルに左右されて
+全件失敗することがあるため使わない。
+
 注意:
   ・二塁打・三塁打の被弾数は無いため、被wOBAは厳密には計算できない。
     代わりに K% / BB% / HR/9 / FIP を算出する。
   ・対戦相手別・球場別の表には「被打者」が無いため、
     被打者 ≒ 3 × 投球回 + 被安 + 四球 + 死球 で推定する（'被打者_推定' = True）。
   ・個別ページの表のレイアウトは実サイトで未確認。表が見つからない投手は
-    df.attrs['failed_players'] に入れてスキップする。
+    df.attrs['failed_players'] に入れてスキップし、理由を df.attrs['errors'] に残す。
 """
-import io
 import re
 import time
 from functools import reduce
+from html.parser import HTMLParser
 from urllib.parse import urljoin
 
 import pandas as pd
@@ -51,13 +55,12 @@ TEAMS = [
     (1, 'M',  'ロッテ',       'パ・リーグ'),
 ]
 
-ROSTER_TEXT_COLS = {'背番', '名前', '腕', '最終登板'}
+ROSTER_TEXT_COLS = {'背番', '名前', '腕', '最終登板', 'href'}
 
 # 個別ページ内の表の先頭列の見出し → 区分種別
 SPLIT_KEYS = {'チーム': '対戦相手', '球場': '球場'}
 
-STAT_COLS = ['試合', '先発', '救援', '投球回', '被安', '被本', '三振', '四球', '死球',
-             '失点', '自責', '防御率']
+MAX_PLAYER_ERRORS = 5   # 投手ごとのエラー内容は、同種の失敗が多くても先頭の数件だけ残す
 
 
 # ============================================================
@@ -86,22 +89,98 @@ def _get(url: str, params: dict | None = None) -> requests.Response:
     return resp
 
 
-def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """列名の空白を除き、MultiIndex（見出しが2段）の場合は '/' でつないで1段にする"""
-    cols = []
-    for c in df.columns:
-        if isinstance(c, tuple):
-            parts = []
-            for p in c:
-                p = re.sub(r'\s', '', str(p))
-                if p and not p.startswith('Unnamed') and p not in parts:
-                    parts.append(p)
-            cols.append('/'.join(parts))
-        else:
-            cols.append(re.sub(r'\s', '', str(c)))
-    df = df.copy()
-    df.columns = cols
-    return df
+def _page_title(html: str) -> str:
+    m = re.search(r'<title>(.*?)</title>', html, flags=re.S | re.I)
+    return re.sub(r'\s+', ' ', m.group(1)).strip()[:60] if m else '(titleなし)'
+
+
+# ============================================================
+# 標準ライブラリだけのHTML表パーサー
+# ============================================================
+class _TableParser(HTMLParser):
+    """
+    HTML中の全ての <table> を、行 → セル(テキスト, リンクURL) のリストとして集める。
+    入れ子の表（レイアウト用テーブルの中の本体テーブル）は、内側・外側それぞれが
+    別の表として集まる。閉じタグが省略された td / tr も、次の開始タグで閉じる。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables: list[list[list[tuple[str, str | None]]]] = []
+        self._stack: list[dict] = []
+
+    def _close_cell(self, t: dict) -> None:
+        c = t['cell']
+        if c is not None and t['row'] is not None:
+            text = re.sub(r'\s+', ' ', ''.join(c['text'])).strip()
+            t['row'].append((text, c['href']))
+        t['cell'] = None
+
+    def _close_row(self, t: dict) -> None:
+        self._close_cell(t)
+        if t['row']:
+            t['rows'].append(t['row'])
+        t['row'] = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'table':
+            self._stack.append({'rows': [], 'row': None, 'cell': None})
+            return
+        if not self._stack:
+            return
+        t = self._stack[-1]
+        if tag == 'tr':
+            self._close_row(t)
+            t['row'] = []
+        elif tag in ('td', 'th'):
+            self._close_cell(t)
+            if t['row'] is None:
+                t['row'] = []
+            t['cell'] = {'text': [], 'href': None}
+        elif tag == 'a' and t['cell'] is not None and t['cell']['href'] is None:
+            href = dict(attrs).get('href')
+            if href:
+                t['cell']['href'] = href
+        elif tag == 'br' and t['cell'] is not None:
+            t['cell']['text'].append(' ')
+
+    def handle_endtag(self, tag):
+        if not self._stack:
+            return
+        t = self._stack[-1]
+        if tag in ('td', 'th'):
+            self._close_cell(t)
+        elif tag == 'tr':
+            self._close_row(t)
+        elif tag == 'table':
+            self._close_row(t)
+            self.tables.append(self._stack.pop()['rows'])
+
+    def handle_data(self, data):
+        if self._stack and self._stack[-1]['cell'] is not None:
+            self._stack[-1]['cell']['text'].append(data)
+
+
+def _parse_tables(html: str) -> list[list[list[tuple[str, str | None]]]]:
+    p = _TableParser()
+    p.feed(html)
+    p.close()
+    # </table> の閉じ忘れも回収する
+    while p._stack:
+        t = p._stack.pop()
+        p._close_row(t)
+        p.tables.append(t['rows'])
+    return p.tables
+
+
+def _norm_header(cells: list[tuple[str, str | None]]) -> list[str]:
+    return [re.sub(r'\s', '', c[0]) for c in cells]
+
+
+def _row_texts(row, width: int) -> list[str]:
+    """行のセルのテキストを、見出しの列数に合わせて切り詰め／空文字で埋める"""
+    texts = [c[0] for c in row]
+    return (texts + [''] * width)[:width]
 
 
 # ============================================================
@@ -109,34 +188,39 @@ def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 def _fetch_team_roster(leg: int, code: str) -> pd.DataFrame:
     resp = _get(BASE_URL, {'y': 0, 'leg': leg, 'tm': code, 'fp': 1, 'dn': 1, 'dk': 0})
+    tables = _parse_tables(resp.text)
 
-    # extract_links='body' でセルが (テキスト, href) のタプルになる
-    tables = pd.read_html(io.StringIO(resp.text), match='被打者', extract_links='body')
-    df = _flatten_columns(tables[0])
+    for rows in tables:
+        for i, row in enumerate(rows):
+            header = _norm_header(row)
+            if '名前' in header and '被打者' in header:
+                name_idx = header.index('名前')
+                records = []
+                for r in rows[i + 1:]:
+                    texts = _row_texts(r, len(header))
+                    if texts and re.sub(r'\s', '', texts[0]) == header[0]:
+                        continue  # 末尾に再掲される見出し行
+                    rec = dict(zip(header, texts))
+                    href = r[name_idx][1] if name_idx < len(r) else None
+                    rec['href'] = urljoin(resp.url, href) if href else None
+                    records.append(rec)
+                if not records:
+                    raise ValueError('投手一覧の表はあるが、データ行が0件')
+                return pd.DataFrame(records)
 
-    def _text(v):
-        return v[0] if isinstance(v, tuple) else v
-
-    def _href(v):
-        # リンクのないセル（「合計」行など）は None か NaN になるので、文字列のときだけ使う
-        h = v[1] if isinstance(v, tuple) else None
-        return urljoin(resp.url, h) if isinstance(h, str) and h else None
-
-    href = df['名前'].map(_href)
-    df = df.apply(lambda col: col.map(_text))
-    df['href'] = href
-    return df
+    raise ValueError(
+        f'投手一覧の表が見つかりません（表の数={len(tables)}、'
+        f'HTMLの長さ={len(resp.text)}、title={_page_title(resp.text)}）'
+    )
 
 
 def _clean_roster(df: pd.DataFrame) -> pd.DataFrame:
-    # 名前が空の行（先頭の「合計」行など）と、末尾に再掲される見出し行を除く
-    df = df[df['名前'].notna()].copy()
-    df = df[df['名前'].astype(str).str.strip() != '']
-    df = df[df['名前'] != '名前']
+    # 名前が空の行（先頭の「合計」行など）を除く
+    df = df[df['名前'].astype(str).str.strip() != ''].copy()
     df = df[df['背番'].astype(str) != '合計']
 
     for c in df.columns:
-        if c not in ROSTER_TEXT_COLS and c != 'href':
+        if c not in ROSTER_TEXT_COLS:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
     # 登板がなく成績が空の行は除く
@@ -168,36 +252,49 @@ def _parse_split_tables(html: str) -> list[dict]:
     """
     個別ページから「チーム」「球場」で始まる表を探し、縦持ちの行リストにする。
     同じ見出しの表が複数に分かれている場合（打者ページの2ブロック構造と同様）は、
-    先頭列をキーに横結合する。
+    先頭列をキーに横結合する。表が1つも見つからなければ ValueError。
     """
-    tables = pd.read_html(io.StringIO(html))
+    tables = _parse_tables(html)
 
     groups: dict[str, list[pd.DataFrame]] = {}
-    for t in tables:
-        t = _flatten_columns(t)
-        if len(t.columns) == 0:
-            continue
-        first = t.columns[0]
-        if first in SPLIT_KEYS:
-            groups.setdefault(first, []).append(t)
+    for rows in tables:
+        for i, row in enumerate(rows):
+            header = _norm_header(row)
+            if (header and header[0] in SPLIT_KEYS
+                    and '被安' in header and '回数' in header):
+                body = []
+                for r in rows[i + 1:]:
+                    if len(r) < 5:
+                        break  # 表の終わり（注記行など）
+                    texts = _row_texts(r, len(header))
+                    if re.sub(r'\s', '', texts[0]) == header[0]:
+                        continue
+                    body.append(texts)
+                if body:
+                    groups.setdefault(header[0], []).append(pd.DataFrame(body, columns=header))
+                break
 
-    rows: list[dict] = []
+    if not groups:
+        raise ValueError(
+            f'対戦相手別・球場別の表が見つかりません（表の数={len(tables)}、'
+            f'title={_page_title(html)}）'
+        )
+
+    out: list[dict] = []
     for first, tabs in groups.items():
         def _merge(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
             extra = [c for c in b.columns if c not in a.columns]
             return a.merge(b[[first] + extra], on=first, how='left')
 
         merged = reduce(_merge, tabs)
-        if '被安' not in merged.columns or '回数' not in merged.columns:
-            continue
-
         for c in merged.columns:
             if c != first:
                 merged[c] = pd.to_numeric(merged[c], errors='coerce')
 
+        kind = SPLIT_KEYS[first]
         for _, r in merged.iterrows():
             name = str(r[first]).strip()
-            if not name or name in ('nan', '合計', '計', '通算', first):
+            if not name or name in ('nan', '合計', '計', '通算'):
                 continue
 
             ip = _ip_to_float(r.get('回数'))
@@ -205,8 +302,7 @@ def _parse_split_tables(html: str) -> list[dict]:
             if pd.isna(ip) or (ip == 0 and (pd.isna(h) or (h + bb + hbp) == 0)):
                 continue  # 登板なし
 
-            kind = SPLIT_KEYS[first]
-            row = {
+            out.append({
                 '区分種別': kind,
                 '区分名': normalize_team_name(name) if kind == '対戦相手' else name,
                 '試合': r.get('試合'), '先発': r.get('先発'), '救援': r.get('救援'),
@@ -214,9 +310,8 @@ def _parse_split_tables(html: str) -> list[dict]:
                 '四球': bb, '死球': hbp, '失点': r.get('失点'), '自責': r.get('自責'),
                 '防御率': r.get('防御率'),
                 '被打者': 3 * ip + h + bb + hbp, '被打者_推定': True,
-            }
-            rows.append(row)
-    return rows
+            })
+    return out
 
 
 # ============================================================
@@ -270,22 +365,28 @@ def scrape_all_pitchers(
     on_progress(ti, n_teams, team_name, pi, n_players, player_name) は
     scrape_all_batters と同じ形式。
 
-    取得に失敗した球団・投手は飛ばし、df.attrs['failed_teams'] /
-    df.attrs['failed_players'] に記録する。
+    取得に失敗した球団・投手は飛ばし、戻り値の DataFrame の attrs に記録する:
+      df.attrs['failed_teams']   : 取得できなかった球団
+      df.attrs['failed_players'] : 個別ページを取得できなかった投手
+      df.attrs['errors']         : 失敗の理由（原因調査用。投手分は先頭の数件のみ）
     min_ip を指定すると、通算の投球回がそれ未満の投手を除く。
     """
     all_rows: list[dict] = []
     failed_teams: list[str] = []
     failed_players: list[str] = []
+    errors: list[str] = []
     n_teams = len(TEAMS)
 
     for ti, (leg, code, team_raw, league_name) in enumerate(TEAMS):
         team = normalize_team_name(team_raw)
 
+        if on_progress:
+            on_progress(ti, n_teams, team, 0, 1, '選手一覧')
         try:
             roster = _clean_roster(_fetch_team_roster(leg, code))
-        except Exception:
+        except Exception as e:
             failed_teams.append(team)
+            errors.append(f'{team}（球団ページ）: {type(e).__name__}: {e}')
             time.sleep(sleep_sec)
             continue
 
@@ -303,21 +404,26 @@ def scrape_all_pitchers(
             all_rows.append({**base, **_roster_total_row(r)})
 
             href = r.get('href')
-            if href:
-                try:
-                    html = _get(href).text
-                    for sp in _parse_split_tables(html):
-                        all_rows.append({**base, **sp})
-                except Exception:
-                    failed_players.append(f'{team} {pname}')
-                time.sleep(sleep_sec)
-            else:
+            if not href:
                 failed_players.append(f'{team} {pname}')
+                if len(errors) < len(failed_teams) + MAX_PLAYER_ERRORS:
+                    errors.append(f'{team} {pname}: 個別ページへのリンクが無い')
+                continue
+
+            try:
+                for sp in _parse_split_tables(_get(href).text):
+                    all_rows.append({**base, **sp})
+            except Exception as e:
+                failed_players.append(f'{team} {pname}')
+                if len(errors) < len(failed_teams) + MAX_PLAYER_ERRORS:
+                    errors.append(f'{team} {pname}（{href}）: {type(e).__name__}: {e}')
+            time.sleep(sleep_sec)
 
     if not all_rows:
         out = pd.DataFrame()
         out.attrs['failed_teams'] = failed_teams
         out.attrs['failed_players'] = failed_players
+        out.attrs['errors'] = errors
         return out
 
     df = pd.DataFrame(all_rows)
@@ -325,11 +431,12 @@ def scrape_all_pitchers(
 
     if min_ip > 0:
         tot = df[df['区分種別'] == '通算']
-        keep = set(zip(tot.loc[tot['投球回'] >= min_ip, '選手名_key'],
-                       tot.loc[tot['投球回'] >= min_ip, 'TM']))
+        ok = tot[tot['投球回'] >= min_ip]
+        keep = set(zip(ok['選手名_key'], ok['TM']))
         mask = [(k, t) in keep for k, t in zip(df['選手名_key'], df['TM'])]
         df = df[mask].reset_index(drop=True)
 
     df.attrs['failed_teams'] = failed_teams
     df.attrs['failed_players'] = failed_players
+    df.attrs['errors'] = errors
     return df
