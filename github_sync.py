@@ -15,6 +15,9 @@ import requests
 import pandas as pd
 from github import Github, GithubException
 
+BATTER_CSV_PATH  = 'data/all_batters_situational.csv'
+PITCHER_CSV_PATH = 'data/all_pitchers.csv'
+
 
 def get_repo(token: str, repo_name: str):
     return Github(token).get_repo(repo_name)
@@ -69,38 +72,24 @@ def upsert_csv(
 
 
 # ============================================================
-# 対戦相手別・球場別打撃成績CSV（all_batters_situational.csv）の
-# GitHub への保存 / GitHub からの読み込み（単一ファイルなので
-# get_contents + decoded_content で1回のAPIコールのみ）
+# 単一CSVの GitHub からの読み込み（共通処理）
+#
+# GitHub の Contents API は1MB超のファイルだと content(base64) を返さない
+# （encoding が 'none' になり decoded_content が使えない）ため、
+# api.github.com に対して Accept: application/vnd.github.raw ヘッダーで
+# 直接リクエストして raw content を取得する。
+#
+# 注意: content.download_url（raw.githubusercontent.com）は Fastly の CDN
+# キャッシュを経由するため、コミット直後でも数分間古い内容が返ってくることが
+# ある。api.github.com への直接リクエストはこのCDNを経由しないため、
+# 常に最新のコミット内容を取得できる。
 # ============================================================
-def save_batter_csv_to_github(
+def load_csv_from_github(
     token: str,
     repo_name: str,
-    df: pd.DataFrame,
+    path: str,
     branch: str = 'main',
-    path: str = 'data/all_batters_situational.csv',
-) -> tuple[bool, str]:
-    repo = get_repo(token, repo_name)
-    return upsert_csv_at_path(repo, df, path, '[auto] update all_batters_situational.csv', branch)
-
-
-def load_batter_csv_from_github(
-    token: str,
-    repo_name: str,
-    branch: str = 'main',
-    path: str = 'data/all_batters_situational.csv',
 ) -> pd.DataFrame | None:
-    """
-    GitHub の Contents API は1MB超のファイルだと content(base64) を返さない
-    （encoding が 'none' になり decoded_content が使えない）ため、
-    api.github.com に対して Accept: application/vnd.github.raw ヘッダーで
-    直接リクエストして raw content を取得する。
-
-    注意: content.download_url（raw.githubusercontent.com）は Fastly の CDN
-    キャッシュを経由するため、コミット直後でも数分間古い内容が返ってくることが
-    ある。api.github.com への直接リクエストはこのCDNを経由しないため、
-    常に最新のコミット内容を取得できる。
-    """
     repo = get_repo(token, repo_name)
     try:
         content = repo.get_contents(path, ref=branch)
@@ -134,6 +123,52 @@ def load_batter_csv_from_github(
 
 
 # ============================================================
+# 対戦相手別・球場別打撃成績CSV（all_batters_situational.csv）
+# ============================================================
+def save_batter_csv_to_github(
+    token: str,
+    repo_name: str,
+    df: pd.DataFrame,
+    branch: str = 'main',
+    path: str = BATTER_CSV_PATH,
+) -> tuple[bool, str]:
+    repo = get_repo(token, repo_name)
+    return upsert_csv_at_path(repo, df, path, '[auto] update all_batters_situational.csv', branch)
+
+
+def load_batter_csv_from_github(
+    token: str,
+    repo_name: str,
+    branch: str = 'main',
+    path: str = BATTER_CSV_PATH,
+) -> pd.DataFrame | None:
+    return load_csv_from_github(token, repo_name, path, branch)
+
+
+# ============================================================
+# 投手成績CSV（all_pitchers.csv）
+# ============================================================
+def save_pitcher_csv_to_github(
+    token: str,
+    repo_name: str,
+    df: pd.DataFrame,
+    branch: str = 'main',
+    path: str = PITCHER_CSV_PATH,
+) -> tuple[bool, str]:
+    repo = get_repo(token, repo_name)
+    return upsert_csv_at_path(repo, df, path, '[auto] update all_pitchers.csv', branch)
+
+
+def load_pitcher_csv_from_github(
+    token: str,
+    repo_name: str,
+    branch: str = 'main',
+    path: str = PITCHER_CSV_PATH,
+) -> pd.DataFrame | None:
+    return load_csv_from_github(token, repo_name, path, branch)
+
+
+# ============================================================
 # 複数ファイルを一括コミット
 # ============================================================
 def commit_game_files(
@@ -161,7 +196,7 @@ def commit_game_files(
 
 
 # ============================================================
-# 【新規】リポジトリの zipball を1回のリクエストで取得し、
+# リポジトリの zipball を1回のリクエストで取得し、
 # data/gamedata/*_details.csv をメモリ上に展開して返す。
 #
 # 従来: ファイル数 N 件につき N 回の API コール（decoded_content の遅延取得）
