@@ -522,22 +522,34 @@ def page_settings(gh_cfg):
     st.divider()
     st.subheader('⚾ 投手成績データの更新')
     st.caption(
-        'nf3.sakura.ne.jp からセ・パ・交流戦の投手成績（投球回・被安打・三振・四球など）を取得し、'
-        'GitHub の `data/all_pitchers.csv` を更新します。リーグ単位の一覧表なので数秒で終わります。'
+        'nf3.sakura.ne.jp から全12球団・全投手の通算・対戦相手別・球場別成績を再取得し、'
+        'GitHub の `data/all_pitchers.csv` を更新します。投手数が多いため数分かかります。'
     )
     pitcher_sleep = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 1.5, 0.5, key='pitcher_sleep')
 
     if st.button('🔄 投手成績データを更新', type='secondary'):
         p_bar = st.progress(0, text='準備中...')
+        p_log = st.empty()
 
-        def on_pitcher_progress(i, total, league_name):
-            p_bar.progress(i / total, text=f'[{i + 1}/{total}] {league_name} を取得中')
+        def on_pitcher_progress(ti, n_teams, team_name, pi, n_players, player_name):
+            pct = (ti + pi / max(n_players, 1)) / n_teams
+            p_bar.progress(min(pct, 1.0), text=f'[{team_name}] {player_name} ({pi + 1}/{n_players})')
+            p_log.text(f'{team_name}: {player_name} を取得中 ({ti + 1}/{n_teams} 球団)')
 
         with st.spinner('投手データを取得中...'):
             df_pitchers = scrape_all_pitchers(
                 sleep_sec=pitcher_sleep, on_progress=on_pitcher_progress,
             )
         p_bar.progress(1.0, text='取得完了')
+        p_log.empty()
+
+        failed_teams   = df_pitchers.attrs.get('failed_teams', [])
+        failed_players = df_pitchers.attrs.get('failed_players', [])
+        if failed_teams:
+            st.warning(f'取得できなかった球団: {", ".join(failed_teams)}')
+        if failed_players:
+            with st.expander(f'個別ページを取得できなかった投手（{len(failed_players)} 人・通算成績のみ保存）'):
+                st.write('、'.join(failed_players))
 
         if df_pitchers.empty:
             st.error(
@@ -545,11 +557,12 @@ def page_settings(gh_cfg):
                 'またはアクセスが制限されている可能性があります。'
             )
         else:
-            n_p = df_pitchers['選手名'].nunique()
+            n_p = df_pitchers[['選手名_key', 'TM']].drop_duplicates().shape[0]
             st.success(f'✅ {n_p} 投手分・{len(df_pitchers):,} 行のデータを取得しました。')
             st.dataframe(
-                df_pitchers[['選手名', '球団', '腕', 'リーグ', '投球回', '被打者',
-                             'K%', 'BB%', 'FIP', '防御率']].round(3).head(20),
+                df_pitchers[df_pitchers['区分種別'] == '通算']
+                [['選手名', '球団', '腕', '投球回', '被打者', 'K%', 'BB%', 'FIP', '防御率']]
+                .round(3).head(20),
                 use_container_width=True,
             )
 
