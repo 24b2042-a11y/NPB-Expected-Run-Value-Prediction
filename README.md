@@ -6,16 +6,36 @@
 .
 ├── app.py                         # Streamlit アプリ本体
 ├── core.py                        # RE24・wOBA 計算ロジック
-├── scraper.py                     # スポナビ PBP スクレイパー
+├── scraper.py                     # スポナビ PBP スクレイパー（打者ID・対戦投手つき）
+├── player_scraper.py              # スポナビ選手ページ → 選手マスタ（投打・球速）
+├── batter_scraper.py              # nf3 打者の対戦相手別・球場別成績
+├── pitcher_scraper.py             # nf3 投手成績
 ├── github_sync.py                 # GitHub 自動コミット
 ├── requirements.txt
 ├── .streamlit/
 │   └── secrets.toml.example       # Secrets テンプレート（push しない）
 └── data/
     ├── all_batters_situational.csv
+    ├── all_pitchers.csv
+    ├── players.csv                # 選手マスタ（選手ID・投打・ストレート平均球速など）
     └── gamedata/                  # PBP データ（アプリから自動追加）
-        └── *_details.csv
+        └── *_details.csv          # 打者ID・投手名・投手ID・攻撃 の列を含む（2026-11〜）
 ```
+
+### 打席データ × 選手マスタ
+
+`_details.csv` の `打者ID` / `投手ID` と `players.csv` の `選手ID`（スポナビの選手ID）で結合する
+（`core.attach_player_info()`）。名前ではなく ID で結合するので表記ゆれの影響を受けない。
+
+旧形式（ID 列なし）のデータを取り直す手順（ローカル）:
+
+```bash
+python scraper.py --refetch      # 旧形式の試合だけ再取得（約 2 秒/試合）
+python player_scraper.py         # 未取得の選手の投打・球速を取得（約 1.5 秒/人）
+git add data/ && git commit -m "PBP に投手ID を追加、players.csv を追加" && git push
+```
+
+アプリの「設定」ページからも同じ操作ができる（件数を区切って実行可能）。
 
 ## Streamlit Community Cloud へのデプロイ
 
@@ -71,3 +91,12 @@ branch    = "main"
 ```
 補正後期待得点 = 基礎 RE24 × (打者 wOBA / リーグ平均 wOBA)
 ```
+
+打者 wOBA は、対戦相手別 wOBA を選手の全体 wOBA に向けてベイズ収縮した値を使う（`core.predict_batter_woba`）。
+
+```
+打者 wOBA = (PA × wOBA対戦 + C × wOBA全体) / (PA + C)     C = 20（core.SHRINK_C）
+PA = 打席 − 敬遠 − 犠打（wOBA の分母）
+```
+
+対戦打席が少ないほど全体 wOBA に近づき、多いほど対戦相手別 wOBA に近づく。

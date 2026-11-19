@@ -16,7 +16,7 @@ from core import (
     build_model_from_dfs, predict_one, predict_all,
     get_player_career, get_player_current_team, get_team_avg_runs,
     normalize_name, normalize_team_name, build_batter_woba, build_season_batting,
-    RUNNER_LABEL, RUNNER_MAP,
+    RUNNER_LABEL, RUNNER_MAP, SHRINK_C,
 )
 # build_model_from_dfs の戻り値に df_team_batting_stats（対戦球団ごとの
 # 打率・得点期待値）と df_situational_stats（状況別の打率・得点期待値）が
@@ -35,9 +35,13 @@ from github_sync import (
     load_batter_csv_from_github,
     save_pitcher_csv_to_github,
     load_pitcher_csv_from_github,
+    save_players_csv_to_github,
+    load_players_csv_from_github,
+    get_legacy_game_ids,
 )
 from batter_scraper import scrape_all_batters
 from pitcher_scraper import scrape_all_pitchers
+from player_scraper import scrape_players, collect_player_ids, merge_players
 
 st.set_page_config(
     page_title='NPB 得点期待値予測',
@@ -609,6 +613,16 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
              help=f'集計試合数: {n_team_games} 試合' if n_team_games else 'データなし')
     st.caption(f"リーグ平均 wOBA: {league_avg:.3f}")
 
+    # ---- 打者 wOBA（ベイズ収縮）の内訳 ----
+    def _w(v):
+        return f'{v:.3f}' if v is not None else '—'
+    st.caption(
+        f"打者 wOBA = (PA×対戦wOBA + C×全体wOBA) / (PA + C)　"
+        f"= ({res['対戦打席数']}×{_w(res['対戦wOBA(生)'])} + {SHRINK_C}×{_w(res['全体wOBA'])}) "
+        f"/ ({res['対戦打席数']} + {SHRINK_C}) = **{res['打者wOBA']:.3f}**　"
+        f"（全体wOBAへの収縮率 {res['収縮率']:.0%}。PA は打席 − 敬遠 − 犠打）"
+    )
+
     # ---- 対戦球団ごとの実測打率・得点期待値（状況別ではない） ----
     row = filter_team_batting_stats_by_batter(df_team_batting_stats, batter)
     row = row[row['対戦球団'] == opponent]
@@ -655,7 +669,7 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     with tab_chart:
         st.plotly_chart(plot_24_bar(df_all, batter, opponent), use_container_width=True)
     with tab_table:
-        df_show = df_all[['アウト','ランナー','打者wOBA','基礎RE24','補正後期待得点','対戦打席数']]
+        df_show = df_all[['アウト','ランナー','打者wOBA','対戦wOBA(生)','全体wOBA','基礎RE24','補正後期待得点','対戦打席数']]
         st.dataframe(
             df_show.style.background_gradient(
                 subset=['基礎RE24','補正後期待得点'], cmap='RdYlGn', vmin=0,
@@ -843,6 +857,135 @@ def _update_pitchers(gh_cfg: dict, sleep_sec: float) -> tuple[bool, str]:
     return True, f'{n_p} 投手分・{len(df_new):,} 行を GitHub に保存しました（{msg}）'
 
 
+def _commit_with_progress(gh_cfg: dict, collected: list[dict]) -> tuple[int, int]:
+    """試合ファイルを GitHub にコミットし、進捗を表示する"""
+    commit_bar = st.progress(0, text='コミット準備中...')
+
+    def on_progress(i, total, fname, success, msg):
+        commit_bar.progress(i / total, text=f'[{i}/{total}] {"✅" if success else "❌"} {fname}')
+
+    return commit_game_files(
+        token=gh_cfg['token'], repo_name=gh_cfg['repo_name'],
+        files=collected, branch=gh_cfg['branch'], on_progress=on_progress,
+    )
+
+
+def section_legacy_refetch(gh_cfg: dict):
+    """旧形式（投手ID・打者ID の列がない）試合ファイルを取り直す"""
+    st.subheader('🔄 既存試合の再取得（打者ID・対戦投手の列を追加）')
+    st.caption(
+        '2026-11 より前に取得した `_details.csv` には、打者ID・対戦投手（投手名・投手ID）の列がありません。'
+        '打者タイプ × 投手タイプの分析にはこの列が必要なため、一球速報を取り直して上書きします。'
+        '1 回の実行で取り直す件数を指定できます（1 試合あたり 約 2 秒 ＋ GitHub への保存 2 ファイル）。'
+        '全件を一度に取り直す場合は、ローカルで `python scraper.py --refetch` を実行して git でコミットする方が速く確実です。'
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        n_max = st.number_input('今回取り直す試合数', min_value=1, max_value=900, value=100, key='legacy_n')
+    with c2:
+        sleep_sec = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 2.0, 0.5, key='legacy_sleep')
+
+    if not st.button('🔄 旧形式の試合を再取得', key='legacy_refetch'):
+        return
+
+    with st.spinner('GitHub の既存データを確認中...'):
+        legacy_ids, n_all = get_legacy_game_ids(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
+    if not legacy_ids:
+        st.success(f'全 {n_all} 試合が新形式です。再取得は不要です。')
+        return
+    targets = legacy_ids[:int(n_max)]
+    st.info(f'旧形式 **{len(legacy_ids)}** / 全 {n_all} 試合 → 今回 **{len(targets)}** 試合を再取得します。')
+
+    bar = st.progress(0, text='準備中...')
+    collected, n_ok, n_ng, n_nop = [], 0, 0, 0
+    for i, r in enumerate(scrape_games(0, 0, sleep_sec=sleep_sec, game_ids=targets)):
+        bar.progress((i + 1) / len(targets), text=f'[{i + 1}/{len(targets)}] {r["game_id"]} {r["card"]} {r["message"]}')
+        if r['status'] != 'ok':
+            n_ng += 1
+            continue
+        n_ok += 1
+        n_nop += int(r['df_details']['投手ID'].isna().sum())
+        gid, card = r['game_id'], r['card']
+        collected.append({'filename': f'{gid}_{card}_details.csv', 'df': r['df_details']})
+        if r['df_score'] is not None:
+            collected.append({'filename': f'{gid}_{card}_score.csv', 'df': r['df_score']})
+
+    st.caption(f'取得: 成功 {n_ok} / 失敗 {n_ng}　投手を特定できなかった打席: {n_nop}')
+    if not collected:
+        st.warning('保存するデータがありません。')
+        return
+    ok_cnt, fail_cnt = _commit_with_progress(gh_cfg, collected)
+    if fail_cnt == 0:
+        st.success(f'✅ {ok_cnt} ファイルを GitHub に保存しました。残りの旧形式: {len(legacy_ids) - n_ok} 試合')
+    else:
+        st.warning(f'{ok_cnt} 件成功 / {fail_cnt} 件失敗')
+    reload_model()
+
+
+def section_player_master(gh_cfg: dict):
+    """選手マスタ（投打・球速）を更新する"""
+    st.subheader('🧾 選手マスタ（投打・球速）の更新')
+    st.caption(
+        '一球速報に出てくる打者・投手について、スポナビの選手ページから **投打（右投左打など）** と '
+        '**球種別の球速（ストレート平均球速・全球種の加重平均球速）** を取得し、`data/players.csv` に保存します。'
+        '先に「既存試合の再取得」で打者ID・投手ID の列を揃えてください。'
+        '球速は選手ページの「今シーズン」の集計値です。'
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        refetch_all = st.checkbox('取得済みの選手も取り直す（球速を最新にする）', key='players_all')
+    with c2:
+        sleep_sec = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 1.5, 0.5, key='players_sleep')
+
+    if not st.button('🧾 選手マスタを更新', key='players_update'):
+        return
+
+    with st.spinner('試合データと既存の選手マスタを読み込み中...'):
+        dfs, _ = load_details_from_github(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
+        try:
+            df_old = load_players_csv_from_github(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
+        except Exception:
+            df_old = None
+    ids = collect_player_ids(dfs)
+    if not ids:
+        st.warning('打者ID・投手ID のある試合データがありません。先に「既存試合の再取得」を実行してください。')
+        return
+    if df_old is not None and not refetch_all:
+        have = set(df_old['選手ID'].astype(str).str.replace(r'\.0$', '', regex=True))
+        ids = [i for i in ids if i not in have]
+    if not ids:
+        st.success('新しく取得する選手はいません。')
+        return
+
+    st.info(f'{len(ids)} 人を取得します（約 {len(ids) * sleep_sec / 60:.0f} 分）。')
+    bar = st.progress(0, text='準備中...')
+
+    def on_progress(i, n, pid, name):
+        bar.progress(i / n, text=f'[{i}/{n}] {pid} {name}')
+
+    df_new = scrape_players(ids, sleep_sec=sleep_sec, on_progress=on_progress)
+    failed = df_new.attrs.get('failed_ids', [])
+    if failed:
+        with st.expander(f'取得できなかった選手（{len(failed)} 人）'):
+            st.text('\n'.join(failed))
+    if df_new.empty:
+        st.error('選手データを取得できませんでした。')
+        return
+    if len(failed) > len(ids) * 0.3 and not st.session_state.get('force_save', False):
+        st.error('取得に失敗した選手が多いため保存を見送りました（サイト構造の変更の可能性）。')
+        return
+
+    df = merge_players(df_old, df_new)
+    n_toda = df['投'].notna().sum()
+    n_velo = df['直球_平均球速'].notna().sum()
+    st.caption(f'マスタ {len(df)} 人（投打あり {n_toda} 人 / ストレート球速あり {n_velo} 人）')
+    ok, msg = save_players_csv_to_github(gh_cfg['token'], gh_cfg['repo_name'], df, gh_cfg['branch'])
+    if ok:
+        st.success(f'✅ 選手マスタを保存しました（{msg}）')
+    else:
+        st.error(f'❌ 保存に失敗しました: {msg}')
+
+
 # ============================================================
 # 設定ページ: データ取得・更新
 # ============================================================
@@ -961,11 +1104,18 @@ def page_settings(gh_cfg):
         reload_model()
 
     st.divider()
+    section_legacy_refetch(gh_cfg)
+
+    st.divider()
+    section_player_master(gh_cfg)
+
+    st.divider()
     st.subheader('📁 データソース')
     st.markdown(
         f'- 打席イベント: GitHub `data/gamedata/*_details.csv`\n'
         f'- 状況別打者成績: `data/all_batters_situational.csv`\n'
         f'- 投手成績: `data/all_pitchers.csv`\n'
+        f'- 選手マスタ（投打・球速）: `data/players.csv`\n'
         f'- 過去3年成績: `data/2023~2025打撃データ/stats_YYYY.csv`'
     )
 

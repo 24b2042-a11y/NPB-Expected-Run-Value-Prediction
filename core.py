@@ -14,6 +14,12 @@ RUNNER_MAP = {
 RUNNER_LABEL = ['走者なし', '1塁', '2塁', '3塁', '1,2塁', '1,3塁', '2,3塁', '満塁']
 WOBA_W       = dict(BB=0.70, HBP=0.73, S=0.89, D=1.27, T=1.61, HR=2.10)
 RE_SCORE     = re.compile(r'\S+\s+(\d+)-(\d+)\s+\S+')
+# scraper.py が _details.csv に追加した列（2026-11〜）。calc_runs_after で引き継ぐ
+DETAIL_EXTRA_COLS = ['打者ID', '投手名', '投手ID', '攻撃']
+# 対戦相手別 wOBA のベイズ収縮の強さ（＝事前分布の重みを「何打席分」とみなすか）
+#   wOBA予測 = (PA×wOBA対戦 + C×wOBA全体) / (PA + C)
+#   ポスター記載の値 C = 20。PA は wOBA の分母（打席 − 敬遠 − 犠打）
+SHRINK_C = 20
 
 # 球団の正式名称（カード表記）→ 状況別データの区分名に統一するマッピング
 # ※ raw 側は normalize_team_name 内で NFKC 正規化してから照合するため、
@@ -214,8 +220,70 @@ def calc_runs_after(all_df: pd.DataFrame) -> pd.DataFrame:
                     'runs_after':    int(suffix[i]),
                     'home_team_raw': home_raw,
                     'away_team_raw': away_raw,
+                    # 打者ID・投手ID など（scraper.EXTRA_COLS）。旧形式の CSV では None
+                    **{c: row.get(c) for c in DETAIL_EXTRA_COLS},
                 })
     return pd.DataFrame(results)
+
+
+# ============================================================
+# 選手マスタ（data/players.csv）の結合
+# ============================================================
+def normalize_player_id(v) -> str | None:
+    """
+    選手IDを文字列に揃える。CSV 読み込み時に欠損があると 1600123.0 のような
+    float になるため、そのままでは players.csv の ID と一致しない。
+    """
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
+    s = str(v).strip()
+    if s.endswith('.0'):
+        s = s[:-2]
+    return s or None
+
+
+def attach_player_info(df_runs: pd.DataFrame, df_players: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    打席データ（calc_runs_after の出力）に、選手マスタから打者・投手の属性を付ける。
+
+    追加する列:
+        打者_打        : 打者の登録上の打席（右/左/両）
+        打者_打席      : この打席で実際に立った側（右/左）。両打は投手の逆側とみなす
+        投手_腕        : 投手の投げ腕（右/左）
+        投手_直球球速  : 投手のストレート平均球速（km/h）
+        投手_平均球速  : 投手の全球種の加重平均球速（km/h）
+        同側対戦       : 打者_打席 == 投手_腕（右対右・左対左）なら True
+
+    打者ID・投手ID の列がない旧形式のデータや、マスタに無い選手は NaN のまま。
+    """
+    df = df_runs.copy()
+    for c in ('打者ID', '投手ID'):
+        if c not in df.columns:
+            df[c] = None
+        df[c] = df[c].apply(normalize_player_id)
+
+    if df_players is None or df_players.empty:
+        for c in ('打者_打', '打者_打席', '投手_腕', '投手_直球球速', '投手_平均球速', '同側対戦'):
+            df[c] = np.nan
+        return df
+
+    pl = df_players.copy()
+    pl['選手ID'] = pl['選手ID'].apply(normalize_player_id)
+    pl = pl.drop_duplicates('選手ID').set_index('選手ID')
+
+    df['打者_打']       = df['打者ID'].map(pl['打'])
+    df['投手_腕']       = df['投手ID'].map(pl['投'])
+    df['投手_直球球速'] = df['投手ID'].map(pl['直球_平均球速'])
+    df['投手_平均球速'] = df['投手ID'].map(pl['全球種_平均球速'])
+
+    opposite = {'右': '左', '左': '右'}
+    df['打者_打席'] = np.where(df['打者_打'] == '両',
+                               df['投手_腕'].map(opposite),
+                               df['打者_打'])
+    df['打者_打席'] = df['打者_打席'].where(df['打者_打席'].isin(['右', '左']))
+    known = df['打者_打席'].notna() & df['投手_腕'].notna()
+    df['同側対戦'] = (df['打者_打席'] == df['投手_腕']).where(known)
+    return df
 
 
 # ============================================================
@@ -412,7 +480,60 @@ def build_batter_woba(df_raw: pd.DataFrame):
     df['wOBA']      = np.where(df['wOBA_den'] >= 10,
                                df['wOBA_num'] / df['wOBA_den'], np.nan)
     league_avg      = df[df['wOBA_den'] >= 30]['wOBA'].mean()
-    return df[['選手名', '選手名_key', '区分名', '球団', '試合', '打席', 'wOBA']].copy(), float(league_avg)
+    # wOBA_num / wOBA_den はベイズ収縮（predict_batter_woba）で使う
+    return (df[['選手名', '選手名_key', '区分名', '球団', '試合', '打席', 'wOBA', 'wOBA_num', 'wOBA_den']].copy(),
+            float(league_avg))
+
+
+# ============================================================
+# Step 4.2: 対戦相手別 wOBA のベイズ収縮
+# ============================================================
+def predict_batter_woba(df_woba: pd.DataFrame, batter_name: str, opponent: str,
+                        league_avg: float, c: float = SHRINK_C) -> dict:
+    """
+    打者の「対戦相手別 wOBA」を、その打者の全体 wOBA に向けて収縮させた予測値を返す。
+
+        wOBA予測 = (PA × wOBA対戦 + C × wOBA全体) / (PA + C)
+                 = (wOBA分子_対戦 + C × wOBA全体) / (wOBA分母_対戦 + C)
+
+      PA        : 対戦相手との wOBA の分母（打席 − 敬遠 − 犠打）
+      wOBA全体  : 全対戦相手を合計した wOBA（分子の合計 / 分母の合計）
+      C         : 収縮の強さ（SHRINK_C = 20 打席分）
+
+    対戦打席が少ないほど全体 wOBA に近づき、多いほど対戦 wOBA に近づく。
+    以前の「分母 10 未満なら全体平均に切り替え」という不連続な扱いを置き換える。
+    選手データ自体がない場合はリーグ平均 wOBA を返す。
+
+    Returns
+    -------
+    dict: wOBA予測, wOBA対戦（生の値・分母0ならNone）, wOBA全体, 対戦PA, 対戦試合数, 収縮率（C/(PA+C)）, note
+    """
+    key = normalize_name(batter_name)
+    sub = df_woba[df_woba['選手名_key'] == key]
+    num_all = float(sub['wOBA_num'].sum()) if not sub.empty else 0.0
+    den_all = float(sub['wOBA_den'].clip(lower=0).sum()) if not sub.empty else 0.0
+
+    if den_all <= 0:
+        return {'wOBA予測': league_avg, 'wOBA対戦': None, 'wOBA全体': None,
+                '対戦PA': 0, '対戦試合数': 0, '収縮率': 1.0,
+                'note': f'※ {batter_name} の打撃データなし → リーグ平均wOBAを使用'}
+
+    woba_all = num_all / den_all
+    hit = sub[sub['区分名'] == opponent]
+    num_o = float(hit['wOBA_num'].sum()) if not hit.empty else 0.0
+    den_o = float(hit['wOBA_den'].clip(lower=0).sum()) if not hit.empty else 0.0
+    games = int(hit['試合'].sum()) if not hit.empty else 0
+
+    pred   = (num_o + c * woba_all) / (den_o + c)
+    shrink = c / (den_o + c)
+    note = ''
+    if den_o <= 0:
+        note = f'※ {batter_name} vs {opponent} の対戦データなし → {batter_name} の全体wOBAを使用'
+    return {'wOBA予測': pred,
+            'wOBA対戦': (num_o / den_o) if den_o > 0 else None,
+            'wOBA全体': woba_all,
+            '対戦PA': int(den_o), '対戦試合数': games,
+            '収縮率': shrink, 'note': note}
 
 
 # ============================================================
@@ -519,26 +640,12 @@ def predict_one(re24, df_woba, league_avg,
     runner_idx = RUNNER_MAP.get(runner, 0)
     base_re    = re24.iloc[out, runner_idx]
 
-    key = normalize_name(batter_name)
-    hit = df_woba[(df_woba['選手名_key'] == key) & (df_woba['区分名'] == opponent)]
-
-    if len(hit) > 0 and not pd.isna(hit['wOBA'].values[0]):
-        batter_woba = float(hit['wOBA'].values[0])
-        pa          = int(hit['打席'].values[0])
-        games       = int(hit['試合'].values[0])
-        note        = ''
-    else:
-        # 対戦相手別データがない場合は、リーグ平均ではなく
-        # その選手自身の全対戦相手平均 wOBA を優先して使用する
-        avg_woba, _avg_pa, _avg_games = get_batter_avg_woba(df_woba, batter_name)
-        pa    = 0
-        games = 0
-        if avg_woba is not None:
-            batter_woba = avg_woba
-            note = f'※ {batter_name} vs {opponent} のデータなし → {batter_name} の全対戦相手平均wOBAを使用'
-        else:
-            batter_woba = league_avg
-            note = f'※ {batter_name} vs {opponent} のデータなし → 選手データもないためリーグ平均を使用'
+    # 対戦相手別 wOBA を全体 wOBA へベイズ収縮した値を打者の能力とする（ポスターの式）
+    est         = predict_batter_woba(df_woba, batter_name, opponent, league_avg)
+    batter_woba = est['wOBA予測']
+    pa          = est['対戦PA']
+    games       = est['対戦試合数']
+    note        = est['note']
 
     adj_re = (base_re * (batter_woba / league_avg)
               if not np.isnan(base_re) and league_avg > 0 else np.nan)
@@ -547,6 +654,9 @@ def predict_one(re24, df_woba, league_avg,
         'アウト':         out,
         'ランナー':       runner if runner else '走者なし',
         '打者wOBA':       round(batter_woba, 3),
+        '対戦wOBA(生)':   round(est['wOBA対戦'], 3) if est['wOBA対戦'] is not None else None,
+        '全体wOBA':       round(est['wOBA全体'], 3) if est['wOBA全体'] is not None else None,
+        '収縮率':         round(est['収縮率'], 3),
         '対戦打席数':     pa,
         '対戦試合数':     games,
         '基礎RE24':       round(float(base_re), 3) if not np.isnan(base_re) else None,

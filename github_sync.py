@@ -17,6 +17,7 @@ from github import Github, GithubException
 
 BATTER_CSV_PATH  = 'data/all_batters_situational.csv'
 PITCHER_CSV_PATH = 'data/all_pitchers.csv'
+PLAYERS_CSV_PATH = 'data/players.csv'
 
 
 def get_repo(token: str, repo_name: str):
@@ -169,6 +170,29 @@ def load_pitcher_csv_from_github(
 
 
 # ============================================================
+# 選手マスタCSV（players.csv: 投打・球速。player_scraper.py が作成）
+# ============================================================
+def save_players_csv_to_github(
+    token: str,
+    repo_name: str,
+    df: pd.DataFrame,
+    branch: str = 'main',
+    path: str = PLAYERS_CSV_PATH,
+) -> tuple[bool, str]:
+    repo = get_repo(token, repo_name)
+    return upsert_csv_at_path(repo, df, path, '[auto] update players.csv', branch)
+
+
+def load_players_csv_from_github(
+    token: str,
+    repo_name: str,
+    branch: str = 'main',
+    path: str = PLAYERS_CSV_PATH,
+) -> pd.DataFrame | None:
+    return load_csv_from_github(token, repo_name, path, branch)
+
+
+# ============================================================
 # 複数ファイルを一括コミット
 # ============================================================
 def commit_game_files(
@@ -314,6 +338,27 @@ def get_existing_game_ids(
             latest_id = game_id
 
     return complete_ids, incomplete_ids, latest_id
+
+
+def get_legacy_game_ids(
+    token: str,
+    repo_name: str,
+    branch: str = 'main',
+) -> tuple[list[int], int]:
+    """
+    打者ID・投手ID の列がない（2026-11 より前の形式の）_details.csv の game_id を返す。
+    Returns: (legacy_ids 昇順, 全ファイル数)
+    """
+    legacy, n_all = [], 0
+    for fname, df in _fetch_details_archive(token, repo_name, branch):
+        try:
+            gid = int(fname.split('_', 1)[0])
+        except Exception:
+            continue
+        n_all += 1
+        if not {'打者ID', '投手ID'}.issubset(df.columns):
+            legacy.append(gid)
+    return sorted(legacy), n_all
 
 
 def _is_complete(df: pd.DataFrame) -> bool:
