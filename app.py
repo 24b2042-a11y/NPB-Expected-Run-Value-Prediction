@@ -15,7 +15,7 @@ import plotly.express as px
 from core import (
     build_model_from_dfs, predict_one, predict_all,
     get_player_career, get_player_current_team, get_team_avg_runs,
-    normalize_name, normalize_team_name, build_batter_woba,
+    normalize_name, normalize_team_name, build_batter_woba, build_season_batting,
     RUNNER_LABEL, RUNNER_MAP,
 )
 # build_model_from_dfs の戻り値に df_team_batting_stats（対戦球団ごとの
@@ -50,6 +50,7 @@ BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 BATTER_CSV = os.path.join(BASE_DIR, 'data', 'all_batters_situational.csv')
 STATS_DIR  = os.path.join(BASE_DIR, 'data', '2023~2025打撃データ')
 START_ID   = 2021038624
+CURRENT_SEASON = 2026   # 「今シーズン」として表示する年（nf3 の y=0 = 当年度のデータ）
 
 RUNNER_STR_MAP = {
     (False, False, False): '走者なし',
@@ -80,6 +81,7 @@ def load_model(token: str, repo_name: str, branch: str):
 
 def reload_model():
     load_model.clear()
+    load_season_batting.clear()
     st.rerun()
 
 
@@ -87,6 +89,15 @@ def reload_model():
 def load_pitchers(token: str, repo_name: str, branch: str):
     """投手成績CSV（data/all_pitchers.csv）。まだ無い場合は None"""
     return load_pitcher_csv_from_github(token, repo_name, branch)
+
+
+@st.cache_data(show_spinner='今シーズンの成績を集計しています...')
+def load_season_batting(token: str, repo_name: str, branch: str):
+    """対戦相手別の打者成績CSVを選手×球団ごとに合計した、今シーズンの通算成績"""
+    batter_df = load_batter_csv_from_github(token, repo_name, branch)
+    if batter_df is None:
+        batter_df = pd.read_csv(BATTER_CSV, encoding='utf-8-sig')
+    return build_season_batting(batter_df)
 
 
 def get_github_cfg() -> dict | None:
@@ -301,10 +312,17 @@ def render_pitcher_stats(df_pitchers, opponent: str | None = None, key_prefix: s
 # ============================================================
 # 打者の個人成績（メインページ・選手成績ページ共通）
 # ============================================================
-def render_batter_stats(batter, df_woba, df_career, df_team_batting_stats):
-    tab_recent, tab_real, tab_career = st.tabs(
-        ['今シーズン（対戦相手別 wOBA）', '対戦球団別（実測打率・得点期待値）', '過去3年成績']
-    )
+def render_batter_stats(batter, df_woba, df_career, df_team_batting_stats, df_season=None):
+    tab_names = ['今シーズン（対戦相手別 wOBA）', '対戦球団別（実測打率・得点期待値）', '過去3年成績']
+    if df_season is not None:
+        tab_names = [f'{CURRENT_SEASON}年成績'] + tab_names
+    tabs = st.tabs(tab_names)
+    if df_season is not None:
+        with tabs[0]:
+            render_season_batting(batter, df_season)
+        tab_recent, tab_real, tab_career = tabs[1:]
+    else:
+        tab_recent, tab_real, tab_career = tabs
 
     with tab_recent:
         df_b = (df_woba[df_woba['選手名'] == batter][['区分名','打席','wOBA']]
@@ -339,14 +357,142 @@ def render_batter_stats(batter, df_woba, df_career, df_team_batting_stats):
 
 
 # ============================================================
+# 今シーズンの成績（個人・一覧）
+# ============================================================
+BATTER_LB_COLS  = ['選手名', '球団', '試合', '打席', '打数', '安打', '本塁', '打点', '盗塁',
+                   '四球', '三振', '打率', '出塁率', '長打率', 'OPS', 'wOBA']
+PITCHER_LB_COLS = ['選手名', '球団', '腕', '試合', '先発', '救援', '投球回', '被打者',
+                   '防御率', 'K%', 'BB%', 'WHIP', 'FIP']
+LOWER_IS_BETTER = {'防御率', 'FIP', 'WHIP', 'BB%'}
+
+
+def render_season_batting(batter, df_season):
+    """選んだ打者の今シーズン通算（対戦相手別成績の合計）"""
+    key  = normalize_name(batter)
+    mine = df_season[df_season['選手名_key'] == key].sort_values('打席', ascending=False)
+    if mine.empty:
+        st.caption(f'{batter} の{CURRENT_SEASON}年成績データがありません。')
+        return
+
+    r = mine.iloc[0]
+
+    def rate(name):
+        return 'N/A' if name not in r.index or pd.isna(r[name]) else f'{r[name]:.3f}'
+
+    def cnt(name):
+        return _int_str(r[name]) if name in r.index else 'N/A'
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric('打率', rate('打率'))
+    a2.metric('出塁率', rate('出塁率'))
+    a3.metric('長打率', rate('長打率'))
+    a4.metric('OPS', rate('OPS'))
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric('wOBA', rate('wOBA'))
+    b2.metric('本塁打', cnt('本塁'))
+    b3.metric('打点', cnt('打点'))
+    b4.metric('盗塁', cnt('盗塁'))
+
+    cols = ['球団', '試合', '打席', '打数', '安打', '2B', '3B', '本塁', '打点', '盗塁',
+            '四球', '死球', '三振', '打率', '出塁率', '長打率', 'OPS', 'wOBA']
+    d = mine[[c for c in cols if c in mine.columns]].copy()
+    for c in ('打率', '出塁率', '長打率', 'OPS', 'wOBA'):
+        if c in d.columns:
+            d[c] = d[c].round(3)
+    st.dataframe(d.reset_index(drop=True), use_container_width=True)
+    note = f'{CURRENT_SEASON}年の対戦相手別成績（nf3）を合計した通算です。'
+    if len(mine) > 1:
+        note += '移籍した選手は球団ごとに行が分かれ、上の指標は打席数の多い球団のものです。'
+    st.caption(note)
+
+
+def render_season_leaderboard(df_season, df_pitchers):
+    """今シーズンの打者・投手の成績一覧（列の見出しをクリックして並べ替えも可能）"""
+    sub_b, sub_p = st.tabs(['🏏 打者', '⚾ 投手'])
+
+    with sub_b:
+        if df_season is None or df_season.empty:
+            st.caption('打者の成績データがありません。「⚙️ 設定」ページで打者データを更新してください。')
+        else:
+            teams = sorted(df_season['球団'].dropna().astype(str).unique().tolist())
+            c1, c2, c3 = st.columns(3)
+            team   = c1.selectbox('球団', ['全球団'] + teams, key='lb_b_team')
+            min_pa = c2.number_input('最低打席数', min_value=0, max_value=800, value=100,
+                                     step=10, key='lb_b_minpa')
+            sort_opts = [c for c in ('OPS', 'wOBA', '打率', '出塁率', '長打率', '本塁', '打点', '盗塁', '打席')
+                         if c in df_season.columns]
+            sort_col = c3.selectbox('並べ替え', sort_opts, key='lb_b_sort')
+
+            d = df_season[df_season['打席'] >= min_pa]
+            if team != '全球団':
+                d = d[d['球団'].astype(str) == team]
+            if d.empty:
+                st.caption('条件に合う打者がいません。')
+            else:
+                d = d.sort_values(sort_col, ascending=False, na_position='last')
+                show = d[[c for c in BATTER_LB_COLS if c in d.columns]].copy()
+                for c in ('打率', '出塁率', '長打率', 'OPS', 'wOBA'):
+                    if c in show.columns:
+                        show[c] = show[c].round(3)
+                st.dataframe(show.reset_index(drop=True), use_container_width=True, height=600)
+                st.download_button(
+                    '📥 CSV ダウンロード',
+                    data=show.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'),
+                    file_name=f'{CURRENT_SEASON}_打者成績.csv', mime='text/csv', key='lb_b_dl',
+                )
+            st.caption('対戦相手別成績の合計から計算しています。セ・リーグは投手の打席も含まれるため、'
+                       '最低打席数で絞って見てください。')
+
+    with sub_p:
+        tot = None
+        if df_pitchers is not None and not df_pitchers.empty:
+            tot = df_pitchers[df_pitchers['区分種別'] == '通算']
+        if tot is None or tot.empty:
+            st.caption('投手の成績データがありません。「⚙️ 設定」ページで投手データを更新してください。')
+        else:
+            teams = sorted(tot['球団'].dropna().astype(str).unique().tolist())
+            c1, c2, c3 = st.columns(3)
+            team   = c1.selectbox('球団', ['全球団'] + teams, key='lb_p_team')
+            min_ip = c2.number_input('最低投球回', min_value=0, max_value=250, value=30,
+                                     step=5, key='lb_p_minip')
+            sort_opts = [c for c in ('防御率', 'FIP', 'WHIP', 'K%', 'BB%', '投球回', '試合')
+                         if c in tot.columns]
+            sort_col = c3.selectbox('並べ替え', sort_opts, key='lb_p_sort')
+
+            d = tot[tot['投球回'] >= min_ip]
+            if team != '全球団':
+                d = d[d['球団'].astype(str) == team]
+            if d.empty:
+                st.caption('条件に合う投手がいません。')
+            else:
+                d = d.sort_values(sort_col, ascending=(sort_col in LOWER_IS_BETTER), na_position='last')
+                show = d[[c for c in PITCHER_LB_COLS if c in d.columns]].copy()
+                show['投球回'] = show['投球回'].apply(_ip_str)
+                for c in ('K%', 'BB%'):
+                    if c in show.columns:
+                        show[c] = (show[c] * 100).round(1)
+                for c in ('防御率', 'WHIP', 'FIP'):
+                    if c in show.columns:
+                        show[c] = show[c].round(2)
+                st.dataframe(show.reset_index(drop=True), use_container_width=True, height=600)
+                st.download_button(
+                    '📥 CSV ダウンロード',
+                    data=show.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'),
+                    file_name=f'{CURRENT_SEASON}_投手成績.csv', mime='text/csv', key='lb_p_dl',
+                )
+            st.caption('通算成績（リーグ戦＋交流戦）です。防御率・FIP・WHIP・BB% は小さいほど良いので、'
+                       'それらで並べ替えると小さい順になります。')
+
+
+# ============================================================
 # 選手成績ページ: 打者・投手の成績を選んで閲覧する
 # ============================================================
-def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers):
+def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers, df_season=None):
     st.title('👥 選手成績')
     st.caption('打者・投手を選んで成績を閲覧できます。')
     st.divider()
 
-    tab_bat, tab_pit = st.tabs(['🏏 打者', '⚾ 投手'])
+    tab_bat, tab_pit, tab_lb = st.tabs(['🏏 打者', '⚾ 投手', f'📋 {CURRENT_SEASON}年 成績一覧'])
 
     with tab_bat:
         names = df_woba[['選手名', '選手名_key']].drop_duplicates()
@@ -377,18 +523,21 @@ def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers):
             batter = st.selectbox('選手を選択', candidates, key='players_batter_select')
             team = get_player_current_team(df_career, batter)
             st.markdown(f'### {batter}' + (f'　{team}' if team else ''))
-            render_batter_stats(batter, df_woba, df_career, df_team_batting_stats)
+            render_batter_stats(batter, df_woba, df_career, df_team_batting_stats, df_season)
         st.caption('所属球団は過去3年成績データの最新年度のものです。')
 
     with tab_pit:
         render_pitcher_stats(df_pitchers, None, key_prefix='players_pitcher')
+
+    with tab_lb:
+        render_season_leaderboard(df_season, df_pitchers)
 
 
 # ============================================================
 # メインページ: 得点期待値予測 + 選手個人成績
 # ============================================================
 def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
-              df_team_batting_stats, df_situational_stats, df_pitchers=None):
+              df_team_batting_stats, df_situational_stats, df_pitchers=None, df_season=None):
     st.title('⚾ 得点期待値予測')
     st.caption(f'使用データ: {n_games} 試合 / {n_pa:,} 打席  |  リーグ平均 wOBA: {league_avg:.3f}')
     st.divider()
@@ -525,7 +674,7 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     # ---- 選手個人成績 ----
     st.subheader(f'👤 {batter} の個人成績')
 
-    render_batter_stats(batter, df_woba, df_career, df_team_batting_stats)
+    render_batter_stats(batter, df_woba, df_career, df_team_batting_stats, df_season)
 
     # ---- 投手の成績 ----
     page_pitcher_section(df_pitchers, opponent)
@@ -845,6 +994,7 @@ def page_settings(gh_cfg):
                 st.error(f'❌ {name}: {msg}')
         if any(ok for _, ok, _ in results):
             load_model.clear()
+            load_season_batting.clear()
             load_pitchers.clear()
             st.info('キャッシュをクリアしました。メイン・選手成績ページを開くと、最新のデータで再計算されます。')
 
@@ -861,6 +1011,7 @@ def page_settings(gh_cfg):
         if ok:
             st.success(f'✅ {msg}')
             load_model.clear()
+            load_season_batting.clear()
             st.info('キャッシュをクリアしました。メイン・選手成績ページを開くと、最新のデータで再計算されます。')
         else:
             st.error(f'❌ {msg}')
@@ -926,16 +1077,17 @@ def main():
             gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
         )
         df_pitchers = load_pitchers(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
+        df_season   = load_season_batting(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
 
         if current == '🔮 メイン（予測）':
             if n_games == 0:
                 st.info('試合データがありません。サイドバーから「⚙️ 設定」を選択して取得してください。')
                 st.stop()
             page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
-                      df_team_batting_stats, df_situational_stats, df_pitchers)
+                      df_team_batting_stats, df_situational_stats, df_pitchers, df_season)
         else:
             # 選手成績ページは、試合データ（PBP）が未取得でも打者・投手の成績を閲覧できる
-            page_players(df_woba, df_career, df_team_batting_stats, df_pitchers)
+            page_players(df_woba, df_career, df_team_batting_stats, df_pitchers, df_season)
 
     elif current == '⚙️ 設定（データ更新）':
         page_settings(gh_cfg)
