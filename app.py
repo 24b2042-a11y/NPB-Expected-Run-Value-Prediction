@@ -14,7 +14,7 @@ import plotly.express as px
 from core import (
     build_model_from_dfs, predict_one, predict_all,
     get_player_career, get_player_current_team, get_team_avg_runs,
-    normalize_name,
+    normalize_name, normalize_team_name,
     RUNNER_LABEL, RUNNER_MAP,
 )
 # build_model_from_dfs の戻り値に df_team_batting_stats（対戦球団ごとの
@@ -33,6 +33,7 @@ from github_sync import (
     save_batter_csv_to_github,
     load_batter_csv_from_github,
     save_pitcher_csv_to_github,
+    load_pitcher_csv_from_github,
 )
 from batter_scraper import scrape_all_batters
 from pitcher_scraper import scrape_all_pitchers
@@ -79,6 +80,12 @@ def load_model(token: str, repo_name: str, branch: str):
 def reload_model():
     load_model.clear()
     st.rerun()
+
+
+@st.cache_data(show_spinner='投手データを読み込んでいます...')
+def load_pitchers(token: str, repo_name: str, branch: str):
+    """投手成績CSV（data/all_pitchers.csv）。まだ無い場合は None"""
+    return load_pitcher_csv_from_github(token, repo_name, branch)
 
 
 def get_github_cfg() -> dict | None:
@@ -176,10 +183,122 @@ def filter_team_batting_stats_by_batter(df_team_batting_stats: pd.DataFrame, bat
 
 
 # ============================================================
+# 投手の成績（data/all_pitchers.csv）
+# ============================================================
+def _ip_str(ip) -> str:
+    """投球回の実数（68.333）を野球の表記（68.1）に戻す"""
+    if ip is None or pd.isna(ip):
+        return 'N/A'
+    whole = int(ip + 1e-9)
+    outs  = int(round((ip - whole) * 3))
+    if outs == 3:
+        whole, outs = whole + 1, 0
+    return f'{whole}.{outs}'
+
+
+def _fmt(v, f: str = '{:.2f}') -> str:
+    return 'N/A' if v is None or pd.isna(v) else f.format(v)
+
+
+def _int_str(v) -> str:
+    return 'N/A' if v is None or pd.isna(v) else str(int(v))
+
+
+def page_pitcher_section(df_pitchers, opponent: str | None = None):
+    st.divider()
+    st.subheader('🧢 投手の成績')
+
+    if df_pitchers is None or df_pitchers.empty:
+        st.caption('投手データがありません。「⚙️ 設定」ページの「投手成績データを更新」で取得してください。')
+        return
+
+    tot = df_pitchers[df_pitchers['区分種別'] == '通算'].copy()
+    if tot.empty:
+        st.caption('投手の通算成績がありません。投手データを更新してください。')
+        return
+
+    tot['ラベル'] = tot['選手名'] + '（' + tot['球団'].astype(str) + '）'
+    tot = tot.sort_values(['球団', '選手名'])
+
+    # 打者の対戦相手（球団）の投手に絞る。打者はその球団の投手と対戦するため
+    only_opp = False
+    if opponent:
+        only_opp = st.checkbox(
+            f'対戦相手（{opponent}）の投手に絞る', value=True, key='pitcher_only_opp',
+        )
+    cand = tot
+    if only_opp:
+        opp_norm = normalize_team_name(opponent)
+        narrowed = tot[tot['球団'].apply(normalize_team_name) == opp_norm]
+        if narrowed.empty:
+            st.caption(f'{opponent} の投手データが見つかりません。全球団から選べます。')
+        else:
+            cand = narrowed
+
+    query = st.text_input('🔍 投手名を入力', placeholder='例: 村上、戸郷', key='pitcher_query')
+    if query:
+        cand = cand[cand['選手名'].str.contains(query, regex=False)]
+    if cand.empty:
+        st.warning(f'「{query}」に一致する投手が見つかりません。')
+        return
+
+    label = st.selectbox('投手を選択', cand['ラベル'].tolist(), key='pitcher_select')
+    sel   = cand[cand['ラベル'] == label].iloc[0]
+    mine  = df_pitchers[(df_pitchers['選手名_key'] == sel['選手名_key'])
+                        & (df_pitchers['TM'] == sel['TM'])]
+
+    arm = sel.get('腕')
+    arm_txt = f'　{arm}投げ' if isinstance(arm, str) and arm else ''
+    st.markdown(f"**{sel['選手名']}**　{sel['球団']}{arm_txt}")
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric('防御率', _fmt(sel['防御率']))
+    a2.metric('投球回', _ip_str(sel['投球回']))
+    a3.metric('登板（先発/救援）',
+              f"{_int_str(sel['試合'])}（{_int_str(sel['先発'])}/{_int_str(sel['救援'])}）")
+    a4.metric('被打者', _int_str(sel['被打者']))
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric('K%',  _fmt(sel['K%'] * 100, '{:.1f}%'))
+    b2.metric('BB%', _fmt(sel['BB%'] * 100, '{:.1f}%'))
+    b3.metric('WHIP', _fmt(sel['WHIP']))
+    b4.metric('FIP',  _fmt(sel['FIP']))
+    st.caption('FIP は全投手の通算から求めた定数で補正しており、防御率と同じ目盛りで比べられます。')
+
+    show_cols = ['区分名', '試合', '投球回', '被安', '被本', '三振', '四球', '死球',
+                 '自責', '防御率', 'K%', 'BB%', 'WHIP', 'FIP']
+
+    def split_table(kind: str) -> pd.DataFrame:
+        d = mine[mine['区分種別'] == kind].sort_values('投球回', ascending=False).copy()
+        d['投球回'] = d['投球回'].apply(_ip_str)
+        for c in ('K%', 'BB%'):
+            d[c] = (d[c] * 100).round(1)
+        for c in ('防御率', 'WHIP', 'FIP'):
+            d[c] = d[c].round(2)
+        return d[[c for c in show_cols if c in d.columns]].reset_index(drop=True)
+
+    tab_opp, tab_std = st.tabs(['対戦相手別', '球場別'])
+    with tab_opp:
+        d = split_table('対戦相手')
+        if d.empty:
+            st.caption('対戦相手別のデータがありません（個別ページを取得できていない可能性があります）。')
+        else:
+            st.dataframe(d, use_container_width=True)
+    with tab_std:
+        d = split_table('球場')
+        if d.empty:
+            st.caption('球場別のデータがありません（個別ページを取得できていない可能性があります）。')
+        else:
+            st.dataframe(d, use_container_width=True)
+    st.caption('※ 対戦相手別・球場別の K%・BB% は、被打者を「3×投球回＋被安＋四球＋死球」で'
+               '推定した概算です。投球回が少ないと数値が大きくぶれます。')
+
+
+# ============================================================
 # メインページ: 得点期待値予測 + 選手個人成績
 # ============================================================
 def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
-              df_team_batting_stats, df_situational_stats):
+              df_team_batting_stats, df_situational_stats, df_pitchers=None):
     st.title('⚾ 得点期待値予測')
     st.caption(f'使用データ: {n_games} 試合 / {n_pa:,} 打席  |  リーグ平均 wOBA: {league_avg:.3f}')
     st.divider()
@@ -350,6 +469,9 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
             st.dataframe(df_show, use_container_width=True)
             if len(career) >= 2:
                 st.plotly_chart(plot_career_trend(career), use_container_width=True)
+
+    # ---- 投手の成績 ----
+    page_pitcher_section(df_pitchers, opponent)
 
 
 # ============================================================
@@ -577,6 +699,7 @@ def page_settings(gh_cfg):
                 )
 
             if ok:
+                load_pitchers.clear()
                 st.success(f'✅ GitHub に保存しました: {msg}')
             else:
                 st.error(f'GitHub への保存に失敗しました: {msg}')
@@ -626,8 +749,9 @@ def main():
         if n_games == 0:
             st.info('試合データがありません。サイドバーから「⚙️ 設定」を選択して取得してください。')
             st.stop()
+        df_pitchers = load_pitchers(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
         page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
-                  df_team_batting_stats, df_situational_stats)
+                  df_team_batting_stats, df_situational_stats, df_pitchers)
 
     elif st.session_state['current_page'] == '⚙️ 設定（データ更新）':
         page_settings(gh_cfg)
