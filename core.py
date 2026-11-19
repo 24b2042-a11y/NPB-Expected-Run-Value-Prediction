@@ -509,7 +509,11 @@ def predict_batter_woba(df_woba: pd.DataFrame, batter_name: str, opponent: str,
     dict: wOBA予測, wOBA対戦（生の値・分母0ならNone）, wOBA全体, 対戦PA, 対戦試合数, 収縮率（C/(PA+C)）, note
     """
     key = normalize_name(batter_name)
-    sub = df_woba[df_woba['選手名_key'] == key]
+    sub = df_woba[df_woba['選手名_key'] == key].copy()
+    if 'wOBA_num' not in sub.columns or 'wOBA_den' not in sub.columns:
+        # 古い build_batter_woba で作った表（wOBA と打席だけ）への互換: 打席数を分母とみなす
+        sub['wOBA_den'] = sub['打席'].where(sub['wOBA'].notna(), 0)
+        sub['wOBA_num'] = (sub['wOBA'] * sub['打席']).fillna(0)
     num_all = float(sub['wOBA_num'].sum()) if not sub.empty else 0.0
     den_all = float(sub['wOBA_den'].clip(lower=0).sum()) if not sub.empty else 0.0
 

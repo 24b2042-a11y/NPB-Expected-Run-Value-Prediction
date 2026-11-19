@@ -22,6 +22,14 @@ import scraper as _scraper, core as _core, github_sync as _github_sync, player_s
 for _m in (_scraper, _core, _github_sync, _player_scraper):
     importlib.reload(_m)
 
+# st.cache_data のキャッシュは「キャッシュする関数のコード」と引数で判定されるため、
+# core.py だけを直すと古い core.py で作った結果（列の足りない df_woba など）が使われ続ける。
+# core.py などの中身のハッシュを引数として渡し、自作モジュールが変わったらキャッシュを作り直す。
+import hashlib
+CODE_VERSION = hashlib.md5(b''.join(
+    open(_m.__file__, 'rb').read() for _m in (_scraper, _core, _github_sync, _player_scraper)
+)).hexdigest()[:12]
+
 from core import (
     build_model_from_dfs, predict_one, predict_all,
     get_player_career, get_player_current_team, get_team_avg_runs,
@@ -82,7 +90,7 @@ RUNNER_STR_MAP = {
 # キャッシュ
 # ============================================================
 @st.cache_data(show_spinner='データを読み込んでいます...')
-def load_model(token: str, repo_name: str, branch: str):
+def load_model(token: str, repo_name: str, branch: str, code_version: str = CODE_VERSION):
     dfs, _ = load_details_from_github(token, repo_name, branch)
 
     # 対戦成績CSVはまずGitHub上の最新版を試し、なければリポジトリ同梱のローカル版を使う
@@ -100,13 +108,13 @@ def reload_model():
 
 
 @st.cache_data(show_spinner='投手データを読み込んでいます...')
-def load_pitchers(token: str, repo_name: str, branch: str):
+def load_pitchers(token: str, repo_name: str, branch: str, code_version: str = CODE_VERSION):
     """投手成績CSV（data/all_pitchers.csv）。まだ無い場合は None"""
     return load_pitcher_csv_from_github(token, repo_name, branch)
 
 
 @st.cache_data(show_spinner='今シーズンの成績を集計しています...')
-def load_season_batting(token: str, repo_name: str, branch: str):
+def load_season_batting(token: str, repo_name: str, branch: str, code_version: str = CODE_VERSION):
     """対戦相手別の打者成績CSVを選手×球団ごとに合計した、今シーズンの通算成績"""
     batter_df = load_batter_csv_from_github(token, repo_name, branch)
     if batter_df is None:
@@ -1234,10 +1242,10 @@ def main():
             st.stop()
         (re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
          df_team_batting_stats, df_situational_stats) = load_model(
-            gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
+            gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'], code_version=CODE_VERSION
         )
-        df_pitchers = load_pitchers(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
-        df_season   = load_season_batting(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
+        df_pitchers = load_pitchers(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'], code_version=CODE_VERSION)
+        df_season   = load_season_batting(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'], code_version=CODE_VERSION)
 
         if current == '🔮 メイン（予測）':
             if n_games == 0:
