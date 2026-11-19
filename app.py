@@ -12,6 +12,16 @@ import numpy as np
 import os
 import plotly.graph_objects as go
 import plotly.express as px
+import importlib
+
+# Streamlit Cloud は、GitHub に push された新しい app.py を実行しても、前回読み込んだ
+# 古い core.py などをメモリ（sys.modules）に残したままにすることがある。その状態で
+# 新しく追加した名前を import すると ImportError になるため、自作モジュールは毎回
+# 読み込み直す（scraper → core → github_sync → player_scraper の依存順）。
+import scraper as _scraper, core as _core, github_sync as _github_sync, player_scraper as _player_scraper
+for _m in (_scraper, _core, _github_sync, _player_scraper):
+    importlib.reload(_m)
+
 from core import (
     build_model_from_dfs, predict_one, predict_all,
     get_player_career, get_player_current_team, get_team_avg_runs,
