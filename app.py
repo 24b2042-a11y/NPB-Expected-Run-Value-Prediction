@@ -15,7 +15,7 @@ import plotly.express as px
 from core import (
     build_model_from_dfs, predict_one, predict_all,
     get_player_career, get_player_current_team, get_team_avg_runs,
-    normalize_name, normalize_team_name,
+    normalize_name, normalize_team_name, build_batter_woba,
     RUNNER_LABEL, RUNNER_MAP,
 )
 # build_model_from_dfs の戻り値に df_team_batting_stats（対戦球団ごとの
@@ -532,6 +532,169 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
 
 
 # ============================================================
+# 打者・投手データの更新処理（個別ボタン・一括ボタンの共通部分）
+#   取得 → 検証 → GitHub へ保存 を行い、(成功したか, メッセージ) を返す。
+#   一括更新で片方が失敗しても、もう片方を続けられるよう例外は外に出さない。
+# ============================================================
+BATTER_REQUIRED_COLS  = ['区分種別', '選手名', '区分名', '球団', '試合', '打席',
+                         '安打', '2B', '3B', '本塁', '四球', '死球', '敬遠', '犠打']
+PITCHER_REQUIRED_COLS = ['選手名', '選手名_key', 'TM', '区分種別', '区分名',
+                         '投球回', '被打者', '被安', '三振', '四球', '防御率']
+SHRINK_LIMIT = 0.8   # 既存データより選手数がこの割合を下回ったら、不完全な取得とみなす
+
+
+def _check_batter_df(df_new: pd.DataFrame, df_old: pd.DataFrame | None) -> list[str]:
+    """取得した打者データに問題がないか調べ、問題の説明を返す（空なら問題なし）"""
+    problems = []
+    missing = [c for c in BATTER_REQUIRED_COLS if c not in df_new.columns]
+    if missing:
+        return [f'必要な列がありません: {", ".join(missing)}（サイト構造の変更、または表の取りこぼしの可能性）']
+
+    # 四球・死球・敬遠・犠打は2つ目の表にある列。取りこぼすと wOBA が低く出る
+    for c in ('四球', '死球', '敬遠', '犠打'):
+        if pd.to_numeric(df_new[c], errors='coerce').notna().mean() < 0.9:
+            problems.append(f'「{c}」列の欠損が多い（2つ目の表を取りこぼしている可能性）')
+
+    if df_old is not None and '選手名' in df_old.columns:
+        n_old, n_new = df_old['選手名'].nunique(), df_new['選手名'].nunique()
+        if n_old > 0 and n_new < n_old * SHRINK_LIMIT:
+            problems.append(f'選手数が既存データ（{n_old} 人）より大きく減っています（{n_new} 人）。取得が途中で欠けた可能性')
+    return problems
+
+
+def _check_pitcher_df(df_new: pd.DataFrame, df_old: pd.DataFrame | None) -> list[str]:
+    problems = []
+    failed_teams = df_new.attrs.get('failed_teams', [])
+    if failed_teams:
+        problems.append(f'取得できなかった球団があります: {", ".join(failed_teams)}（このまま保存すると、その球団の投手が消えます）')
+
+    missing = [c for c in PITCHER_REQUIRED_COLS if c not in df_new.columns]
+    if missing:
+        problems.append(f'必要な列がありません: {", ".join(missing)}')
+        return problems
+
+    keys_new = df_new[['選手名_key', 'TM']].drop_duplicates().shape[0]
+    n_failed = len(df_new.attrs.get('failed_players', []))
+    if keys_new and n_failed / keys_new > 0.3:
+        problems.append(f'個別ページを取得できなかった投手が多い（{n_failed}/{keys_new} 人）。対戦相手別・球場別が欠けます')
+
+    if df_old is not None and {'選手名_key', 'TM'}.issubset(df_old.columns):
+        keys_old = df_old[['選手名_key', 'TM']].drop_duplicates().shape[0]
+        if keys_old > 0 and keys_new < keys_old * SHRINK_LIMIT:
+            problems.append(f'投手数が既存データ（{keys_old} 人）より大きく減っています（{keys_new} 人）')
+    return problems
+
+
+def _update_batters(gh_cfg: dict, sleep_sec: float) -> tuple[bool, str]:
+    progress_bar = st.progress(0, text='[打者] 準備中...')
+    log_area = st.empty()
+
+    def on_progress(ti, n_teams, team_name, pi, n_players, player_name):
+        pct = (ti + pi / max(n_players, 1)) / n_teams
+        progress_bar.progress(min(pct, 1.0), text=f'[打者][{team_name}] {player_name} ({pi}/{n_players})')
+        log_area.text(f'{team_name}: {player_name} を取得中 ({ti + 1}/{n_teams} 球団)')
+
+    try:
+        with st.spinner('打者データを取得中...'):
+            df_new = scrape_all_batters(sleep_sec=sleep_sec, on_progress=on_progress)
+    except Exception as e:
+        return False, f'打者データの取得中にエラーが出ました: {type(e).__name__}: {e}'
+    progress_bar.progress(1.0, text='[打者] 取得完了')
+    log_area.empty()
+
+    if df_new is None or df_new.empty:
+        return False, 'データを取得できませんでした。サイト構造が変わっている可能性があります。'
+
+    n_players = df_new['選手名'].nunique() if '選手名' in df_new.columns else 0
+    st.caption(f'取得結果: {n_players} 選手 / {len(df_new):,} 行')
+    try:
+        _, lg = build_batter_woba(df_new)
+        st.caption(f'取得データで計算したリーグ平均 wOBA: {lg:.3f}（極端に低い・高い場合は取得に問題がある可能性）')
+    except Exception as e:
+        st.caption(f'リーグ平均 wOBA を計算できませんでした（列の不足など）: {type(e).__name__}')
+
+    try:
+        df_old = load_batter_csv_from_github(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
+    except Exception:
+        df_old = None
+
+    problems = _check_batter_df(df_new, df_old)
+    if problems:
+        for msg in problems:
+            st.warning(msg)
+        if not st.session_state.get('force_save', False):
+            return False, '検証で問題が見つかったため、GitHub のデータは更新していません（上の警告を確認してください）。'
+        st.info('「検証で問題が出ても保存する」がオンなので保存します。')
+
+    try:
+        ok, msg = save_batter_csv_to_github(
+            gh_cfg['token'], gh_cfg['repo_name'], df_new, gh_cfg['branch']
+        )
+    except Exception as e:
+        return False, f'GitHub への保存中にエラーが出ました: {type(e).__name__}: {e}'
+    if not ok:
+        return False, f'GitHub への保存に失敗しました: {msg}'
+    return True, f'{n_players} 選手分・{len(df_new):,} 行を GitHub に保存しました（{msg}）'
+
+
+def _update_pitchers(gh_cfg: dict, sleep_sec: float) -> tuple[bool, str]:
+    p_bar = st.progress(0, text='[投手] 準備中...')
+    p_log = st.empty()
+
+    def on_progress(ti, n_teams, team_name, pi, n_players, player_name):
+        pct = (ti + pi / max(n_players, 1)) / n_teams
+        p_bar.progress(min(pct, 1.0), text=f'[投手][{team_name}] {player_name} ({pi + 1}/{n_players})')
+        p_log.text(f'{team_name}: {player_name} を取得中 ({ti + 1}/{n_teams} 球団)')
+
+    try:
+        with st.spinner('投手データを取得中...'):
+            df_new = scrape_all_pitchers(sleep_sec=sleep_sec, on_progress=on_progress)
+    except Exception as e:
+        return False, f'投手データの取得中にエラーが出ました: {type(e).__name__}: {e}'
+    p_bar.progress(1.0, text='[投手] 取得完了')
+    p_log.empty()
+
+    failed_players = df_new.attrs.get('failed_players', [])
+    fail_errors    = df_new.attrs.get('errors', [])
+    if failed_players:
+        with st.expander(f'個別ページを取得できなかった投手（{len(failed_players)} 人・通算成績のみ保存）'):
+            st.write('、'.join(failed_players))
+    if fail_errors:
+        with st.expander('失敗の理由（原因調査用）', expanded=df_new.empty):
+            for msg in fail_errors:
+                st.text(msg)
+
+    if df_new.empty:
+        return False, 'データを取得できませんでした。「失敗の理由」を確認してください。'
+
+    n_p = df_new[['選手名_key', 'TM']].drop_duplicates().shape[0]
+    st.caption(f'取得結果: {n_p} 投手 / {len(df_new):,} 行')
+
+    try:
+        df_old = load_pitcher_csv_from_github(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
+    except Exception:
+        df_old = None
+
+    problems = _check_pitcher_df(df_new, df_old)
+    if problems:
+        for msg in problems:
+            st.warning(msg)
+        if not st.session_state.get('force_save', False):
+            return False, '検証で問題が見つかったため、GitHub のデータは更新していません（上の警告を確認してください）。'
+        st.info('「検証で問題が出ても保存する」がオンなので保存します。')
+
+    try:
+        ok, msg = save_pitcher_csv_to_github(
+            gh_cfg['token'], gh_cfg['repo_name'], df_new, gh_cfg['branch']
+        )
+    except Exception as e:
+        return False, f'GitHub への保存中にエラーが出ました: {type(e).__name__}: {e}'
+    if not ok:
+        return False, f'GitHub への保存に失敗しました: {msg}'
+    return True, f'{n_p} 投手分・{len(df_new):,} 行を GitHub に保存しました（{msg}）'
+
+
+# ============================================================
 # 設定ページ: データ取得・更新
 # ============================================================
 def page_settings(gh_cfg):
@@ -658,6 +821,34 @@ def page_settings(gh_cfg):
     )
 
     st.divider()
+    st.subheader('🔁 打者・投手の成績をまとめて更新')
+    st.caption(
+        '打者の対戦成績と投手成績を続けて取得し、GitHub に保存します。'
+        '合わせて十数分かかることがあります。片方が失敗してももう片方は続けます。'
+        '取得データに問題（列の欠損、選手数の大幅な減少など）があると、既存データを壊さないよう保存を見送ります。'
+    )
+    bulk_sleep = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 1.5, 0.5, key='bulk_sleep')
+    st.checkbox('検証で問題が出ても保存する（通常はオフ。個別の更新ボタンにも効きます）', key='force_save')
+
+    if st.button('🔁 打者・投手をまとめて更新', type='primary', key='bulk_update'):
+        results = []
+        st.markdown('#### ① 打者')
+        results.append(('打者',) + _update_batters(gh_cfg, bulk_sleep))
+        st.markdown('#### ② 投手')
+        results.append(('投手',) + _update_pitchers(gh_cfg, bulk_sleep))
+
+        st.markdown('#### 結果')
+        for name, ok, msg in results:
+            if ok:
+                st.success(f'✅ {name}: {msg}')
+            else:
+                st.error(f'❌ {name}: {msg}')
+        if any(ok for _, ok, _ in results):
+            load_model.clear()
+            load_pitchers.clear()
+            st.info('キャッシュをクリアしました。メイン・選手成績ページを開くと、最新のデータで再計算されます。')
+
+    st.divider()
     st.subheader('👤 対戦成績データ（対戦相手別・球場別打率）の更新')
     st.caption(
         'nf3.sakura.ne.jp から全12球団・全選手の対戦相手別・球場別成績を再取得し、'
@@ -666,37 +857,13 @@ def page_settings(gh_cfg):
     batter_sleep = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 1.5, 0.5, key='batter_sleep')
 
     if st.button('🔄 対戦成績データを更新', type='secondary'):
-        progress_bar = st.progress(0, text='準備中...')
-        log_area = st.empty()
-
-        def on_progress(ti, n_teams, team_name, pi, n_players, player_name):
-            pct = (ti + pi / max(n_players, 1)) / n_teams
-            progress_bar.progress(min(pct, 1.0), text=f'[{team_name}] {player_name} ({pi}/{n_players})')
-            log_area.text(f'{team_name}: {player_name} を取得中 ({ti + 1}/{n_teams} 球団)')
-
-        with st.spinner('選手データを取得中...'):
-            df_batters = scrape_all_batters(sleep_sec=batter_sleep, on_progress=on_progress)
-
-        if df_batters.empty:
-            st.error(
-                'データを取得できませんでした。サイト構造が変わっている可能性があります。'
-                '「詳細」ボタン（フィードバック）から報告してください。'
-            )
+        ok, msg = _update_batters(gh_cfg, batter_sleep)
+        if ok:
+            st.success(f'✅ {msg}')
+            load_model.clear()
+            st.info('キャッシュをクリアしました。メイン・選手成績ページを開くと、最新のデータで再計算されます。')
         else:
-            n_players = df_batters['選手名'].nunique()
-            st.success(f'✅ {n_players} 選手分・{len(df_batters):,} 行のデータを取得しました。')
-
-            with st.spinner('GitHub に保存中...'):
-                ok, msg = save_batter_csv_to_github(
-                    gh_cfg['token'], gh_cfg['repo_name'], df_batters, gh_cfg['branch']
-                )
-
-            if ok:
-                st.success(f'✅ GitHub に保存しました: {msg}')
-                st.info('データキャッシュをクリアして再計算します...')
-                reload_model()
-            else:
-                st.error(f'GitHub への保存に失敗しました: {msg}')
+            st.error(f'❌ {msg}')
 
     st.divider()
     st.subheader('⚾ 投手成績データの更新')
@@ -707,59 +874,12 @@ def page_settings(gh_cfg):
     pitcher_sleep = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 1.5, 0.5, key='pitcher_sleep')
 
     if st.button('🔄 投手成績データを更新', type='secondary'):
-        p_bar = st.progress(0, text='準備中...')
-        p_log = st.empty()
-
-        def on_pitcher_progress(ti, n_teams, team_name, pi, n_players, player_name):
-            pct = (ti + pi / max(n_players, 1)) / n_teams
-            p_bar.progress(min(pct, 1.0), text=f'[{team_name}] {player_name} ({pi + 1}/{n_players})')
-            p_log.text(f'{team_name}: {player_name} を取得中 ({ti + 1}/{n_teams} 球団)')
-
-        with st.spinner('投手データを取得中...'):
-            df_pitchers = scrape_all_pitchers(
-                sleep_sec=pitcher_sleep, on_progress=on_pitcher_progress,
-            )
-        p_bar.progress(1.0, text='取得完了')
-        p_log.empty()
-
-        failed_teams   = df_pitchers.attrs.get('failed_teams', [])
-        failed_players = df_pitchers.attrs.get('failed_players', [])
-        fail_errors    = df_pitchers.attrs.get('errors', [])
-        if failed_teams:
-            st.warning(f'取得できなかった球団: {", ".join(failed_teams)}')
-        if failed_players:
-            with st.expander(f'個別ページを取得できなかった投手（{len(failed_players)} 人・通算成績のみ保存）'):
-                st.write('、'.join(failed_players))
-        if fail_errors:
-            with st.expander('失敗の理由（原因調査用）', expanded=df_pitchers.empty):
-                for msg in fail_errors:
-                    st.text(msg)
-
-        if df_pitchers.empty:
-            st.error(
-                'データを取得できませんでした。サイト構造が変わっている、'
-                'またはアクセスが制限されている可能性があります。'
-            )
+        ok, msg = _update_pitchers(gh_cfg, pitcher_sleep)
+        if ok:
+            st.success(f'✅ {msg}')
+            load_pitchers.clear()
         else:
-            n_p = df_pitchers[['選手名_key', 'TM']].drop_duplicates().shape[0]
-            st.success(f'✅ {n_p} 投手分・{len(df_pitchers):,} 行のデータを取得しました。')
-            st.dataframe(
-                df_pitchers[df_pitchers['区分種別'] == '通算']
-                [['選手名', '球団', '腕', '投球回', '被打者', 'K%', 'BB%', 'FIP', '防御率']]
-                .round(3).head(20),
-                use_container_width=True,
-            )
-
-            with st.spinner('GitHub に保存中...'):
-                ok, msg = save_pitcher_csv_to_github(
-                    gh_cfg['token'], gh_cfg['repo_name'], df_pitchers, gh_cfg['branch']
-                )
-
-            if ok:
-                load_pitchers.clear()
-                st.success(f'✅ GitHub に保存しました: {msg}')
-            else:
-                st.error(f'GitHub への保存に失敗しました: {msg}')
+            st.error(f'❌ {msg}')
 
 
 # ============================================================
