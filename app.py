@@ -3,7 +3,8 @@ app.py — NPB 得点期待値予測アプリ
 
 構成:
   1. メインページ … 得点期待値予測 + 選手個人成績
-  2. 設定ページ   … データ取得・更新
+  2. 選手成績ページ … 打者・投手の成績を選んで閲覧
+  3. 設定ページ   … データ取得・更新
 """
 import streamlit as st
 import pandas as pd
@@ -207,7 +208,10 @@ def _int_str(v) -> str:
 def page_pitcher_section(df_pitchers, opponent: str | None = None):
     st.divider()
     st.subheader('🧢 投手の成績')
+    render_pitcher_stats(df_pitchers, opponent, key_prefix='main_pitcher')
 
+
+def render_pitcher_stats(df_pitchers, opponent: str | None = None, key_prefix: str = 'pitcher'):
     if df_pitchers is None or df_pitchers.empty:
         st.caption('投手データがありません。「⚙️ 設定」ページの「投手成績データを更新」で取得してください。')
         return
@@ -224,7 +228,7 @@ def page_pitcher_section(df_pitchers, opponent: str | None = None):
     only_opp = False
     if opponent:
         only_opp = st.checkbox(
-            f'対戦相手（{opponent}）の投手に絞る', value=True, key='pitcher_only_opp',
+            f'対戦相手（{opponent}）の投手に絞る', value=True, key=f'{key_prefix}_only_opp',
         )
     cand = tot
     if only_opp:
@@ -235,14 +239,14 @@ def page_pitcher_section(df_pitchers, opponent: str | None = None):
         else:
             cand = narrowed
 
-    query = st.text_input('🔍 投手名を入力', placeholder='例: 村上、戸郷', key='pitcher_query')
+    query = st.text_input('🔍 投手名を入力', placeholder='例: 村上、戸郷', key=f'{key_prefix}_query')
     if query:
         cand = cand[cand['選手名'].str.contains(query, regex=False)]
     if cand.empty:
         st.warning(f'「{query}」に一致する投手が見つかりません。')
         return
 
-    label = st.selectbox('投手を選択', cand['ラベル'].tolist(), key='pitcher_select')
+    label = st.selectbox('投手を選択', cand['ラベル'].tolist(), key=f'{key_prefix}_select')
     sel   = cand[cand['ラベル'] == label].iloc[0]
     mine  = df_pitchers[(df_pitchers['選手名_key'] == sel['選手名_key'])
                         & (df_pitchers['TM'] == sel['TM'])]
@@ -292,6 +296,92 @@ def page_pitcher_section(df_pitchers, opponent: str | None = None):
             st.dataframe(d, use_container_width=True)
     st.caption('※ 対戦相手別・球場別の K%・BB% は、被打者を「3×投球回＋被安＋四球＋死球」で'
                '推定した概算です。投球回が少ないと数値が大きくぶれます。')
+
+
+# ============================================================
+# 打者の個人成績（メインページ・選手成績ページ共通）
+# ============================================================
+def render_batter_stats(batter, df_woba, df_career, df_team_batting_stats):
+    tab_recent, tab_real, tab_career = st.tabs(
+        ['今シーズン（対戦相手別 wOBA）', '対戦球団別（実測打率・得点期待値）', '過去3年成績']
+    )
+
+    with tab_recent:
+        df_b = (df_woba[df_woba['選手名'] == batter][['区分名','打席','wOBA']]
+                .query('打席 >= 10').sort_values('wOBA', ascending=False))
+        df_b['wOBA'] = df_b['wOBA'].round(3)
+        df_b.columns = ['対戦相手','打席数','wOBA']
+        if df_b.empty:
+            st.caption('対戦相手別データ（打席10以上）がありません。')
+        else:
+            st.dataframe(df_b, use_container_width=True)
+
+    with tab_real:
+        df_r = (filter_team_batting_stats_by_batter(df_team_batting_stats, batter)
+                [['対戦球団','打席','打数','安打','打率','得点期待値']]
+                .sort_values('得点期待値', ascending=False))
+        if df_r.empty:
+            st.caption('実測データ（プレーバイプレー）がありません。')
+        else:
+            st.dataframe(df_r, use_container_width=True)
+            st.caption('打率・得点期待値は標本数が少ない（打席5未満）場合 N/A になります。')
+
+    with tab_career:
+        career = get_player_career(df_career, batter)
+        if career.empty:
+            st.caption('過去成績データが見つかりません。')
+        else:
+            df_show = career[['年度','所属球団','試合','打席','打率','出塁率','長打率','OPS',
+                              '本塁打','打点','盗塁']].reset_index(drop=True)
+            st.dataframe(df_show, use_container_width=True)
+            if len(career) >= 2:
+                st.plotly_chart(plot_career_trend(career), use_container_width=True)
+
+
+# ============================================================
+# 選手成績ページ: 打者・投手の成績を選んで閲覧する
+# ============================================================
+def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers):
+    st.title('👥 選手成績')
+    st.caption('打者・投手を選んで成績を閲覧できます。')
+    st.divider()
+
+    tab_bat, tab_pit = st.tabs(['🏏 打者', '⚾ 投手'])
+
+    with tab_bat:
+        names = df_woba[['選手名', '選手名_key']].drop_duplicates()
+
+        # 所属球団（過去3年成績データの最新年度）で絞り込めるようにする
+        team_of = {}
+        if df_career is not None and not df_career.empty:
+            latest = df_career.sort_values('年度').groupby('選手名_key').tail(1)
+            team_of = dict(zip(latest['選手名_key'], latest['所属球団']))
+        names = names.assign(所属=names['選手名_key'].map(team_of))
+
+        col_t, col_q = st.columns(2)
+        with col_t:
+            teams = sorted(names['所属'].dropna().unique().tolist())
+            team_sel = st.selectbox('球団（所属）', ['全球団'] + teams, key='players_team')
+        with col_q:
+            query = st.text_input('🔍 選手名を入力', placeholder='例: 田中、鈴木、村上',
+                                  key='players_batter_query')
+
+        pool = names if team_sel == '全球団' else names[names['所属'] == team_sel]
+        candidates = sorted(pool['選手名'].unique().tolist())
+        if query:
+            candidates = [b for b in candidates if query in b]
+
+        if not candidates:
+            st.warning('条件に一致する選手が見つかりません。')
+        else:
+            batter = st.selectbox('選手を選択', candidates, key='players_batter_select')
+            team = get_player_current_team(df_career, batter)
+            st.markdown(f'### {batter}' + (f'　{team}' if team else ''))
+            render_batter_stats(batter, df_woba, df_career, df_team_batting_stats)
+        st.caption('所属球団は過去3年成績データの最新年度のものです。')
+
+    with tab_pit:
+        render_pitcher_stats(df_pitchers, None, key_prefix='players_pitcher')
 
 
 # ============================================================
@@ -435,40 +525,7 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     # ---- 選手個人成績 ----
     st.subheader(f'👤 {batter} の個人成績')
 
-    tab_recent, tab_real, tab_career = st.tabs(
-        ['今シーズン（対戦相手別 wOBA）', '対戦球団別（実測打率・得点期待値）', '過去3年成績']
-    )
-
-    with tab_recent:
-        df_b = (df_woba[df_woba['選手名'] == batter][['区分名','打席','wOBA']]
-                .query('打席 >= 10').sort_values('wOBA', ascending=False))
-        df_b['wOBA'] = df_b['wOBA'].round(3)
-        df_b.columns = ['対戦相手','打席数','wOBA']
-        if df_b.empty:
-            st.caption('対戦相手別データ（打席10以上）がありません。')
-        else:
-            st.dataframe(df_b, use_container_width=True)
-
-    with tab_real:
-        df_r = (filter_team_batting_stats_by_batter(df_team_batting_stats, batter)
-                [['対戦球団','打席','打数','安打','打率','得点期待値']]
-                .sort_values('得点期待値', ascending=False))
-        if df_r.empty:
-            st.caption('実測データ（プレーバイプレー）がありません。')
-        else:
-            st.dataframe(df_r, use_container_width=True)
-            st.caption('打率・得点期待値は標本数が少ない（打席5未満）場合 N/A になります。')
-
-    with tab_career:
-        career = get_player_career(df_career, batter)
-        if career.empty:
-            st.caption('過去成績データが見つかりません。')
-        else:
-            df_show = career[['年度','所属球団','試合','打席','打率','出塁率','長打率','OPS',
-                              '本塁打','打点','盗塁']].reset_index(drop=True)
-            st.dataframe(df_show, use_container_width=True)
-            if len(career) >= 2:
-                st.plotly_chart(plot_career_trend(career), use_container_width=True)
+    render_batter_stats(batter, df_woba, df_career, df_team_batting_stats)
 
     # ---- 投手の成績 ----
     page_pitcher_section(df_pitchers, opponent)
@@ -720,7 +777,7 @@ def main():
         st.markdown('## ⚾ NPB 得点期待値')
         st.divider()
 
-        page_options = ['🔮 メイン（予測）', '⚙️ 設定（データ更新）']
+        page_options = ['🔮 メイン（予測）', '👥 選手成績', '⚙️ 設定（データ更新）']
         try:
             default_idx = page_options.index(st.session_state['current_page'])
         except ValueError:
@@ -738,7 +795,9 @@ def main():
         st.divider()
         st.caption('PBP データから計算した RE24 × 打者 wOBA で場面ごとの期待得点を推定します。')
 
-    if st.session_state['current_page'] == '🔮 メイン（予測）':
+    current = st.session_state['current_page']
+
+    if current in ('🔮 メイン（予測）', '👥 選手成績'):
         if not gh_cfg:
             st.error('GitHub の認証情報が設定されていません。「⚙️ 設定」ページを確認してください。')
             st.stop()
@@ -746,14 +805,19 @@ def main():
          df_team_batting_stats, df_situational_stats) = load_model(
             gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
         )
-        if n_games == 0:
-            st.info('試合データがありません。サイドバーから「⚙️ 設定」を選択して取得してください。')
-            st.stop()
         df_pitchers = load_pitchers(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
-        page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
-                  df_team_batting_stats, df_situational_stats, df_pitchers)
 
-    elif st.session_state['current_page'] == '⚙️ 設定（データ更新）':
+        if current == '🔮 メイン（予測）':
+            if n_games == 0:
+                st.info('試合データがありません。サイドバーから「⚙️ 設定」を選択して取得してください。')
+                st.stop()
+            page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
+                      df_team_batting_stats, df_situational_stats, df_pitchers)
+        else:
+            # 選手成績ページは、試合データ（PBP）が未取得でも打者・投手の成績を閲覧できる
+            page_players(df_woba, df_career, df_team_batting_stats, df_pitchers)
+
+    elif current == '⚙️ 設定（データ更新）':
         page_settings(gh_cfg)
 
 
