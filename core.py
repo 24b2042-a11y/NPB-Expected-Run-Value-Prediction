@@ -445,6 +445,72 @@ def get_batter_avg_woba(df_woba: pd.DataFrame, batter_name: str) -> tuple[float 
 
 
 # ============================================================
+# Step 4.6: 今シーズンの打者成績（通算）
+#   対戦相手別の成績（nf3）を、選手×球団ごとに合計してシーズン通算にする。
+#   1試合は必ず1つの対戦相手との試合なので、試合数や打席数を合計して構わない。
+# ============================================================
+SEASON_SUM_COLS = ['試合', '打席', '打数', '得点', '安打', '2B', '3B', '本塁', '塁打', '打点',
+                   '盗塁', '盗刺', '犠打', '犠飛', '四球', '敬遠', '死球', '三振', '併殺']
+
+
+def build_season_batting(batter_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    all_batters_situational.csv 相当の DataFrame から、選手×球団ごとの
+    シーズン成績（打率・出塁率・長打率・OPS・wOBA など）を作る。
+
+    CSVに無い列は飛ばし、打数・塁打が無ければ打席などから補う。
+    wOBA は build_batter_woba と同じ式（四球をそのまま加算、分母は打席 - 敬遠 - 犠打）。
+    必要な列（打席・安打）が無い場合は空の DataFrame を返す。
+    """
+    if batter_df is None or batter_df.empty or '区分種別' not in batter_df.columns:
+        return pd.DataFrame()
+
+    df = batter_df[batter_df['区分種別'] == '対戦相手'].copy()
+    if df.empty or not {'選手名', '打席', '安打'}.issubset(df.columns):
+        return pd.DataFrame()
+    if '球団' not in df.columns:
+        df['球団'] = None
+
+    sum_cols = [c for c in SEASON_SUM_COLS if c in df.columns]
+    for c in sum_cols:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+
+    g = (df.groupby(['選手名', '球団'], dropna=False)[sum_cols]
+           .sum(min_count=1).reset_index())
+    g['選手名_key'] = g['選手名'].apply(normalize_name)
+
+    def col(name):
+        return g[name].fillna(0) if name in g.columns else 0
+
+    pa, h = g['打席'].fillna(0), g['安打'].fillna(0)
+    b2, b3, hr = col('2B'), col('3B'), col('本塁')
+    bb, hbp, sh, sf, ibb = col('四球'), col('死球'), col('犠打'), col('犠飛'), col('敬遠')
+
+    ab = g['打数'] if '打数' in g.columns else (pa - bb - hbp - sh - sf)
+    tb = g['塁打'] if '塁打' in g.columns else (h + b2 + 2 * b3 + 3 * hr)
+    g['打数'], g['塁打'] = ab, tb
+
+    obp_den = ab + bb + hbp + sf
+    with np.errstate(divide='ignore', invalid='ignore'):
+        g['打率']   = np.where(ab > 0, h / ab, np.nan)
+        g['出塁率'] = np.where(obp_den > 0, (h + bb + hbp) / obp_den, np.nan)
+        g['長打率'] = np.where(ab > 0, tb / ab, np.nan)
+        g['OPS']    = g['出塁率'] + g['長打率']
+
+        singles = h - b2 - b3 - hr
+        num = (WOBA_W['BB'] * bb + WOBA_W['HBP'] * hbp + WOBA_W['S'] * singles +
+               WOBA_W['D'] * b2 + WOBA_W['T'] * b3 + WOBA_W['HR'] * hr)
+        den = pa - ibb - sh
+        g['wOBA'] = np.where(den > 0, num / den, np.nan)
+
+    order = ['選手名', '選手名_key', '球団', '試合', '打席', '打数', '得点', '安打', '2B', '3B', '本塁',
+             '塁打', '打点', '盗塁', '四球', '死球', '三振', '犠打', '犠飛',
+             '打率', '出塁率', '長打率', 'OPS', 'wOBA']
+    return (g[[c for c in order if c in g.columns]]
+            .sort_values('打席', ascending=False).reset_index(drop=True))
+
+
+# ============================================================
 # Step 5: 1場面の予測
 # ============================================================
 def predict_one(re24, df_woba, league_avg,
