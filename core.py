@@ -12,7 +12,15 @@ RUNNER_MAP = {
     '満塁':   7,
 }
 RUNNER_LABEL = ['走者なし', '1塁', '2塁', '3塁', '1,2塁', '1,3塁', '2,3塁', '満塁']
-WOBA_W       = dict(BB=0.70, HBP=0.73, S=0.89, D=1.27, T=1.61, HR=2.10)
+# wOBA の係数（BB=敬遠を除く四球、HBP=死球、S=単打、D=二塁打、T=三塁打、HR=本塁打）
+#   MLB: 以前使っていた MLB の係数（The Book / FanGraphs の代表値）
+#   NPB2026: 2026年 NPB レギュラーシーズンの一球速報から算出（core.compute_woba_weights、2026-11-26）
+#     各結果の得点価値 = その結果の打席の ΔRE（RE24 の変化 + 入った得点）の平均
+#     係数 = (結果の得点価値 − 凡退の得点価値 −0.231) × wOBA スケール 1.344
+#     wOBA スケール = リーグ出塁率 0.306 ÷（スケール前のリーグ wOBA）… リーグ平均 wOBA が出塁率と同じになるように調整
+WOBA_W_MLB     = dict(BB=0.70, HBP=0.73, S=0.89, D=1.27, T=1.61, HR=2.10)
+WOBA_W_NPB2026 = dict(BB=0.726, HBP=0.735, S=0.889, D=1.360, T=1.858, HR=2.164)
+WOBA_W         = WOBA_W_NPB2026   # アプリ・検証で使う係数
 RE_SCORE     = re.compile(r'\S+\s+(\d+)-(\d+)\s+\S+')
 # scraper.py が _details.csv に追加した列（2026-11〜）。calc_runs_after で引き継ぐ
 DETAIL_EXTRA_COLS = ['打者ID', '投手名', '投手ID', '攻撃']
@@ -491,7 +499,8 @@ def build_batter_woba(df_raw: pd.DataFrame):
     # 常に空になり「対戦データはあるのに実測データが出ない」という状態になる。
     df['区分名'] = df['区分名'].apply(normalize_team_name)
     df['1B_cnt']    = df['安打'] - df['2B'] - df['3B'] - df['本塁']
-    df['wOBA_num']  = (WOBA_W['BB']  * df['四球'] +
+    # nf3 の「四球」は敬遠を含む（打席 = 打数+四球+死球+犠打+犠飛 が成り立つ）ので、敬遠を引いてから掛ける
+    df['wOBA_num']  = (WOBA_W['BB']  * (df['四球'] - df['敬遠']).clip(lower=0) +
                        WOBA_W['HBP'] * df['死球'] +
                        WOBA_W['S']   * df['1B_cnt'] +
                        WOBA_W['D']   * df['2B'] +
@@ -644,7 +653,7 @@ def build_season_batting(batter_df: pd.DataFrame) -> pd.DataFrame:
         g['OPS']    = g['出塁率'] + g['長打率']
 
         singles = h - b2 - b3 - hr
-        num = (WOBA_W['BB'] * bb + WOBA_W['HBP'] * hbp + WOBA_W['S'] * singles +
+        num = (WOBA_W['BB'] * (bb - ibb).clip(lower=0) + WOBA_W['HBP'] * hbp + WOBA_W['S'] * singles +
                WOBA_W['D'] * b2 + WOBA_W['T'] * b3 + WOBA_W['HR'] * hr)
         den = pa - ibb - sh
         g['wOBA'] = np.where(den > 0, num / den, np.nan)
@@ -807,6 +816,9 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats
             from game_sim import build_sim_model   # game_sim は core を import するので、ここで読み込む
             type_model['form'] = build_form_table(runs_recent, type_model)
             type_model['sim'] = build_sim_model(df_runs, df_players, type_model)
+            # wOBA の係数の算出結果（表示用）と、条件別 wOBA 用の打席の表
+            type_model['woba_weights'] = compute_woba_weights(df_runs, re24)
+            type_model['pa'] = build_pa_table(runs_recent, df_players, type_model)
     else:
         re24 = pd.DataFrame(
             np.full((3, 8), np.nan),
@@ -1216,3 +1228,112 @@ def form_of(form_table: dict | None, role: str, player_id) -> dict | None:
     if t is None or pid not in t.index:
         return None
     return t.loc[pid].to_dict()
+
+
+
+# ============================================================
+# Step 10: wOBA の係数の算出と、選手ごとの条件別 wOBA（2026-11-26）
+# ============================================================
+ERROR_TEXT = re.compile(r'失策|エラー|悪送球|ファンブル|後逸|落球|野選|フィルダースチョイス')
+
+
+def compute_woba_weights(df_runs: pd.DataFrame, re24: pd.DataFrame) -> dict:
+    """
+    一球速報（レギュラーシーズン）から wOBA の係数を算出する（Tango の方法）。
+      1. 各打席の得点価値 ΔRE = RE(次の打席の状況) − RE(この打席の状況) + この打席で入った得点
+      2. 結果ごとに ΔRE を平均 → 得点価値（線形加重）
+      3. 凡退（三振・凡打・犠飛。失策出塁は除く）の得点価値を引く
+      4. リーグの wOBA がリーグの出塁率と同じになるように全体を定数倍（wOBA スケール）
+    Returns: dict(weights=係数 {BB,HBP,S,D,T,HR}, scale, league_obp, out_value, table=結果ごとの得点価値の表)
+    """
+    d = add_result_columns(df_runs)
+    d['runner_idx'] = d['ランナー'].fillna('').map(RUNNER_MAP).fillna(0).astype(int)
+    arr = re24.values
+    d['RE'] = [arr[o, r] for o, r in zip(d['アウト'].astype(int), d['runner_idx'])]
+    g = d.groupby(['game_id', 'イニング'], sort=False)
+    d['dRE'] = g['RE'].shift(-1).fillna(0) - d['RE'] + (d['runs_after'] - g['runs_after'].shift(-1).fillna(0))
+    d['ev'] = d['結果']
+    d.loc[(d['結果'] == 'OUT') & d['本文'].fillna('').str.contains(ERROR_TEXT), 'ev'] = 'ROE'
+    table = d.groupby('ev')['dRE'].agg(得点価値='mean', 件数='size')
+    out_value = float(d[d['ev'].isin(['OUT', 'SO', 'SF'])]['dRE'].mean())
+
+    c = d['結果'].value_counts()
+    n = {k: int(c.get(k, 0)) for k in ('1B', '2B', '3B', 'HR', 'BB', 'IBB', 'HBP', 'SF', 'SAC')}
+    hits = n['1B'] + n['2B'] + n['3B'] + n['HR']
+    ab = int((~d['結果'].isin(['BB', 'IBB', 'HBP', 'SF', 'SAC', 'UNKNOWN'])).sum())
+    obp = (hits + n['BB'] + n['IBB'] + n['HBP']) / (ab + n['BB'] + n['IBB'] + n['HBP'] + n['SF'])
+    key = {'BB': 'BB', 'HBP': 'HBP', 'S': '1B', 'D': '2B', 'T': '3B', 'HR': 'HR'}
+    raw = {k: float(table.loc[e, '得点価値']) - out_value for k, e in key.items()}
+    raw_num = sum(raw[k] * n[e] for k, e in key.items())
+    scale = obp / (raw_num / (ab + n['BB'] + n['HBP'] + n['SF']))
+    table['凡退との差'] = table['得点価値'] - out_value
+    return {'weights': {k: v * scale for k, v in raw.items()}, 'scale': float(scale),
+            'league_obp': float(obp), 'out_value': out_value, 'table': table}
+
+
+RISP_BITS = {'2塁', '3塁', '1,2塁', '1,3塁', '2,3塁', '満塁'}   # 得点圏
+
+
+def build_pa_table(df_runs: pd.DataFrame, df_players: pd.DataFrame | None, model: dict) -> pd.DataFrame:
+    """
+    条件別 wOBA 用の打席の表（calc_runs_after の出力。オールスターを除き、ポストシーズンは含めてよい）。
+    列: gid, 区分, 打者ID, 打者名, 投手ID, 投手名, 打者球団, 投手球団, ホーム/ビジター, イニング番号, アウト, 走者,
+        結果, 打者の打席, 投手の腕, 打者タイプ, 投手タイプ, woba_num, woba_den
+    """
+    d = attach_player_info(add_woba_columns(add_result_columns(df_runs)), df_players)
+    d = d[d['結果'] != 'UNKNOWN']
+    side = np.where(d['イニング'].astype(str).str.contains('表'), 'ビジター', 'ホーム')
+    bat_raw = np.where(side == 'ビジター', d['away_team_raw'], d['home_team_raw'])
+    teams = {t: normalize_team_name(t) for t in pd.unique(np.concatenate([d['away_team_raw'].dropna().unique(),
+                                                                       d['home_team_raw'].dropna().unique()]))}
+    names = {}
+    if df_players is not None and not df_players.empty:
+        names = dict(zip(df_players['選手ID'].apply(normalize_player_id), df_players['選手名']))
+    gid = d['game_id'].astype(int)
+    out = pd.DataFrame({
+        'gid': gid,
+        '区分': np.where(gid.isin(POSTSEASON_IDS), 'ポストシーズン', 'レギュラーシーズン'),
+        '打者ID': d['打者ID'], '投手ID': d['投手ID'],
+        '打者名': d['打者ID'].map(names).fillna(d['選手名']),
+        '投手名': d['投手ID'].map(names).fillna(d['投手名'] if '投手名' in d else None),
+        '打者球団': pd.Series(bat_raw, index=d.index).map(teams),
+        '投手球団': d['対戦球団'],
+        'ホーム/ビジター': side,
+        'イニング番号': d['イニング'].map(lambda x: _inning_sort_key(x)[0]),
+        'アウト': d['アウト'].astype(int),
+        '走者': d['ランナー'].fillna('').replace('', '走者なし'),
+        '結果': d['結果'],
+        '打者の打席': d['打者_打席'], '投手の腕': d['投手_腕'],
+        '打者タイプ': batter_type_label(d['打者_打席'], d['打者ID'].map(model['batters']['長打型'])),
+        '投手タイプ': pitcher_type_label(d['投手_腕'], d['投手ID'].map(model['pitchers']['速球派'])),
+        'woba_num': d['woba_num'], 'woba_den': d['woba_den'],
+    })
+    return out.reset_index(drop=True)
+
+
+def woba_stats(pa: pd.DataFrame) -> dict:
+    """打席の表（build_pa_table の行）から打撃成績と wOBA を計算する"""
+    c = pa['結果'].value_counts()
+    n = {k: int(c.get(k, 0)) for k in ('1B', '2B', '3B', 'HR', 'BB', 'IBB', 'HBP', 'SO', 'SF', 'SAC')}
+    h = n['1B'] + n['2B'] + n['3B'] + n['HR']
+    tpa = len(pa)
+    ab = tpa - n['BB'] - n['IBB'] - n['HBP'] - n['SF'] - n['SAC']
+    obp_den = ab + n['BB'] + n['IBB'] + n['HBP'] + n['SF']
+    den = pa['woba_den'].sum()
+    return {'打席': tpa, '打数': ab, '安打': h, '二塁打': n['2B'], '三塁打': n['3B'], '本塁打': n['HR'],
+            '四球': n['BB'] + n['IBB'], '敬遠': n['IBB'], '死球': n['HBP'], '三振': n['SO'],
+            '犠打': n['SAC'], '犠飛': n['SF'],
+            '打率': h / ab if ab else np.nan,
+            '出塁率': (h + n['BB'] + n['IBB'] + n['HBP']) / obp_den if obp_den else np.nan,
+            '長打率': (n['1B'] + 2 * n['2B'] + 3 * n['3B'] + 4 * n['HR']) / ab if ab else np.nan,
+            'wOBA': pa['woba_num'].sum() / den if den else np.nan}
+
+
+def woba_breakdown(pa: pd.DataFrame, by: str) -> pd.DataFrame:
+    """条件（列名 by）ごとの打撃成績と wOBA の表"""
+    rows = []
+    for key, g in pa.groupby(by, dropna=False):
+        r = {by: key if pd.notna(key) else '不明'}
+        r.update(woba_stats(g))
+        rows.append(r)
+    return pd.DataFrame(rows)

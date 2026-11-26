@@ -40,6 +40,7 @@ from core import (
     get_player_career, get_player_current_team, get_team_avg_runs,
     normalize_name, normalize_team_name, build_batter_woba, build_season_batting,
     RUNNER_LABEL, RUNNER_MAP, FORM_LEVELS, FORM_RATE, form_of,
+    woba_stats, woba_breakdown, RISP_BITS as core_RISP,
 )
 import game_sim
 # build_model_from_dfs の戻り値に df_team_batting_stats（対戦球団ごとの
@@ -1457,6 +1458,152 @@ def page_simulation(type_model):
 
 
 # ============================================================
+# 条件別 wOBA ページ（core.build_pa_table / woba_stats / woba_breakdown）
+# ============================================================
+WOBA_GROUPS = {
+    '相手の左右': None,          # 打者なら投手の腕、投手なら打者の打席
+    '相手のタイプ': None,
+    '対戦球団': None,
+    '走者': '走者',
+    '得点圏': '得点圏',
+    'アウト': 'アウト',
+    'イニング': 'イニング帯',
+    'ホーム/ビジター': 'ホーム/ビジター',
+    '区分（シーズン/ポストシーズン）': '区分',
+}
+
+
+def _fmt3(v):
+    return f'{v:.3f}' if pd.notna(v) else '—'
+
+
+def page_woba(type_model):
+    st.title('📈 条件別 wOBA')
+    if type_model is None or 'pa' not in type_model:
+        st.error('打席データに打者ID・投手ID の列がないため計算できません。')
+        return
+    pa_all = type_model['pa'].copy()
+    pa_all['得点圏'] = np.where(pa_all['走者'].isin(core_RISP), '得点圏', '得点圏以外')
+    pa_all['イニング帯'] = pd.cut(pa_all['イニング番号'], [0, 3, 6, 9, 99],
+                                 labels=['1〜3回', '4〜6回', '7〜9回', '延長']).astype(str)
+    w = type_model.get('woba_weights')
+    st.caption('一球速報の打席から wOBA を計算します。'
+               'wOBA = (0.726×四球 + 0.735×死球 + 0.889×単打 + 1.360×二塁打 + 1.858×三塁打 + 2.164×本塁打)'
+               ' ÷ (打席 − 敬遠 − 犠打)。係数は 2026年 NPB のデータから算出（下の「係数の算出」）。')
+
+    role = st.radio('対象', ['打者', '投手'], horizontal=True, key='woba_role')
+    me, opp = ('打者', '投手') if role == '打者' else ('投手', '打者')
+    pa_all['相手の左右'] = pa_all['投手の腕' if role == '打者' else '打者の打席']
+    pa_all['相手のタイプ'] = pa_all['投手タイプ' if role == '打者' else '打者タイプ']
+    pa_all['対戦球団'] = pa_all['投手球団' if role == '打者' else '打者球団']
+    pa_all['自球団'] = pa_all['打者球団' if role == '打者' else '投手球団']
+
+    cnt = (pa_all.groupby(f'{me}ID').agg(名前=(f'{me}名', 'first'), 球団=('自球団', 'last'), 打席=('結果', 'size'))
+           .sort_values('打席', ascending=False))
+    q = st.text_input('🔍 選手名を入力', key='woba_query', placeholder='例: 佐藤、村上')
+    cand = cnt[cnt['名前'].astype(str).str.contains(q)] if q else cnt
+    if cand.empty:
+        st.warning('一致する選手がいません。')
+        return
+    pid = st.selectbox('選手', list(cand.index),
+                       format_func=lambda x: f"{cnt.loc[x, '名前']}（{cnt.loc[x, '球団']}／{int(cnt.loc[x, '打席'])} 打席）",
+                       key=f'woba_player_{role}')
+
+    st.markdown('**条件**')
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        period = st.selectbox('期間', ['レギュラーシーズン全体', 'シーズン前半', 'シーズン後半', '直近10試合',
+                                      '直近30試合', 'ポストシーズン', '全試合'], key='woba_period')
+        lr = st.multiselect(f'{opp}の左右', ['右', '左'], default=['右', '左'], key='woba_lr')
+    with c2:
+        types = sorted(pa_all['相手のタイプ'].dropna().unique())
+        typ = st.multiselect(f'{opp}のタイプ', types, default=types, key=f'woba_type_{role}')
+        teams = sorted(pa_all['対戦球団'].dropna().unique())
+        tms = st.multiselect('対戦球団', teams, default=teams, key='woba_teams')
+    with c3:
+        runner = st.selectbox('走者', ['すべて', '走者なし', '走者あり', '得点圏', '満塁'], key='woba_runner')
+        outs = st.multiselect('アウト', [0, 1, 2], default=[0, 1, 2], key='woba_outs')
+        hv = st.multiselect('ホーム/ビジター', ['ホーム', 'ビジター'], default=['ホーム', 'ビジター'], key='woba_hv')
+
+    def _apply(df, player=None):
+        if period == 'ポストシーズン':
+            df = df[df['区分'] == 'ポストシーズン']
+        elif period != '全試合':
+            df = df[df['区分'] == 'レギュラーシーズン']
+            mid = np.median(df['gid'].unique())
+            if period == 'シーズン前半':
+                df = df[df['gid'] <= mid]
+            elif period == 'シーズン後半':
+                df = df[df['gid'] > mid]
+            elif period.startswith('直近') and player is not None:
+                n = int(period.replace('直近', '').replace('試合', ''))
+                last = sorted(df['gid'].unique())[-n:]
+                df = df[df['gid'].isin(last)]
+        # 全部選ばれている条件では絞り込まない（左右・タイプが不明な打席も残す）
+        for col, sel, full in (('相手の左右', lr, ['右', '左']), ('相手のタイプ', typ, types),
+                               ('対戦球団', tms, teams), ('アウト', outs, [0, 1, 2]),
+                               ('ホーム/ビジター', hv, ['ホーム', 'ビジター'])):
+            if set(sel) != set(full):
+                df = df[df[col].isin(sel)]
+        if runner == '走者なし':
+            df = df[df['走者'] == '走者なし']
+        elif runner == '走者あり':
+            df = df[df['走者'] != '走者なし']
+        elif runner == '得点圏':
+            df = df[df['得点圏'] == '得点圏']
+        elif runner == '満塁':
+            df = df[df['走者'] == '満塁']
+        return df
+
+    mine = _apply(pa_all[pa_all[f'{me}ID'] == pid], player=pid)
+    league = _apply(pa_all) if not period.startswith('直近') else None
+    s = woba_stats(mine)
+    st.divider()
+    name = cnt.loc[pid, '名前']
+    st.subheader(f'{name} の wOBA' + ('（被 wOBA）' if role == '投手' else ''))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric('wOBA', _fmt3(s['wOBA']))
+    if league is not None and len(league):
+        lw = woba_stats(league)['wOBA']
+        m2.metric('同じ条件のリーグ平均', _fmt3(lw),
+                  delta=f"{s['wOBA'] - lw:+.3f}" if pd.notna(s['wOBA']) else None,
+                  delta_color='normal' if role == '打者' else 'inverse')
+    m3.metric('打席', f"{s['打席']}")
+    m4.metric('打率 / 出塁率 / 長打率', f"{_fmt3(s['打率'])} / {_fmt3(s['出塁率'])} / {_fmt3(s['長打率'])}")
+    if s['打席'] < 50:
+        st.caption('※ 打席が少ないので、偶然の影響が大きい値です（50打席で wOBA の標準誤差は約 ±0.07）。')
+    st.dataframe(pd.DataFrame([{k: v for k, v in s.items() if k not in ('打率', '出塁率', '長打率', 'wOBA')}]),
+                 width='stretch', hide_index=True)
+
+    st.markdown('**条件ごとの内訳**')
+    by_label = st.selectbox('内訳の分け方', list(WOBA_GROUPS), key='woba_by')
+    by = WOBA_GROUPS[by_label] or by_label
+    bd = woba_breakdown(mine, by)
+    if not bd.empty:
+        show = bd[[by, '打席', '打率', '出塁率', '長打率', 'wOBA', '本塁打', '四球', '三振']].copy()
+        for c in ('打率', '出塁率', '長打率', 'wOBA'):
+            show[c] = show[c].map(_fmt3)
+        st.dataframe(show, width='stretch', hide_index=True)
+
+    with st.expander('wOBA の係数の算出（2026年 NPB）'):
+        if w:
+            st.caption('各結果の得点価値 = その結果の打席で、得点期待値（RE24）がどれだけ増えたか＋入った得点 の平均。'
+                       f"凡退の得点価値 {w['out_value']:.3f} との差に wOBA スケール {w['scale']:.3f} を掛けて、"
+                       f"リーグ平均 wOBA がリーグ出塁率 {w['league_obp']:.3f} と同じになるようにしている。")
+            names_ = {'BB': '四球（敬遠除く）', 'HBP': '死球', 'S': '単打', 'D': '二塁打', 'T': '三塁打', 'HR': '本塁打'}
+            from core import WOBA_W_MLB
+            st.dataframe(pd.DataFrame({'結果': list(names_.values()),
+                                       'NPB 2026（算出）': [round(w['weights'][k], 3) for k in names_],
+                                       'MLB（以前の値）': [WOBA_W_MLB[k] for k in names_]}),
+                         width='stretch', hide_index=True)
+            lab = {'1B': '単打', '2B': '二塁打', '3B': '三塁打', 'HR': '本塁打', 'BB': '四球', 'IBB': '敬遠',
+                   'HBP': '死球', 'SO': '三振', 'OUT': '凡打', 'SF': '犠飛', 'SAC': '犠打', 'ROE': '失策出塁',
+                   'UNKNOWN': '判定不能'}
+            t = w['table'].rename(index=lab).round(3)
+            st.dataframe(t, width='stretch')
+
+
+# ============================================================
 def main():
     gh_cfg = get_github_cfg()
 
@@ -1469,7 +1616,8 @@ def main():
         st.markdown('## ⚾ NPB 得点期待値')
         st.divider()
 
-        page_options = ['🔮 メイン（予測）', '🎮 試合シミュレーション', '👥 選手成績', '⚙️ 設定（データ更新）']
+        page_options = ['🔮 メイン（予測）', '🎮 試合シミュレーション', '📈 条件別 wOBA', '👥 選手成績',
+                        '⚙️ 設定（データ更新）']
         try:
             default_idx = page_options.index(st.session_state['current_page'])
         except ValueError:
@@ -1490,7 +1638,7 @@ def main():
 
     current = st.session_state['current_page']
 
-    if current in ('🔮 メイン（予測）', '🎮 試合シミュレーション', '👥 選手成績'):
+    if current in ('🔮 メイン（予測）', '🎮 試合シミュレーション', '📈 条件別 wOBA', '👥 選手成績'):
         if gh_cfg:
             src = (gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
         else:
@@ -1504,6 +1652,8 @@ def main():
 
         if current == '🎮 試合シミュレーション':
             page_simulation(type_model)
+        elif current == '📈 条件別 wOBA':
+            page_woba(type_model)
         elif current == '🔮 メイン（予測）':
             if n_games == 0:
                 st.info('試合データがありません。サイドバーから「⚙️ 設定」を選択して取得してください。')
