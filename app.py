@@ -40,7 +40,7 @@ from core import (
     get_player_career, get_player_current_team, get_team_avg_runs,
     normalize_name, normalize_team_name, build_batter_woba, build_season_batting,
     RUNNER_LABEL, RUNNER_MAP, FORM_LEVELS, FORM_RATE, form_of,
-    woba_stats, woba_breakdown, RISP_BITS as core_RISP,
+    woba_stats, woba_breakdown, RISP_BITS as core_RISP, conditional_batter_woba, C_COND,
 )
 import game_sim
 # build_model_from_dfs の戻り値に df_team_batting_stats（対戦球団ごとの
@@ -708,9 +708,47 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
 
     st.divider()
 
+    # ---- 条件別 wOBA（打者の wOBA を、いまの条件での成績に置き換える） ----
+    st.markdown('**条件別 wOBA**')
+    cond_keys = st.multiselect(
+        '打者 wOBA を絞り込む条件（空にすると全体の wOBA）',
+        ['走者', 'アウト', '得点圏', '対戦球団', 'ホーム/ビジター'], default=['走者', 'アウト'], key='cond_keys')
+    hv = None
+    if 'ホーム/ビジター' in cond_keys:
+        hv = st.radio(f'{batter} のチームは', ['ホーム', 'ビジター'], horizontal=True, key='cond_hv')
+
+    def _conds(o, r):
+        c = {}
+        if '走者' in cond_keys:
+            c['走者'] = r
+        if 'アウト' in cond_keys:
+            c['アウト'] = o
+        if '得点圏' in cond_keys:
+            c['得点圏'] = r in core_RISP
+        if '対戦球団' in cond_keys:
+            c['対戦球団'] = opponent
+        if hv:
+            c['ホーム/ビジター'] = hv
+        return c
+
+    cw = conditional_batter_woba(type_model, batter_id, _conds(out, runner)) if cond_keys and batter_id else None
+    if cw:
+        def _lab(k, v):
+            if k == '得点圏':
+                return '得点圏' if v else '得点圏以外'
+            if k == 'アウト':
+                return f'{v}アウト'
+            return f'{v}' if k != '対戦球団' else f'対{v}'
+        cond_txt = '・'.join(_lab(k, v) for k, v in _conds(out, runner).items())
+        st.caption(f"この条件（{cond_txt}）での wOBA {_fmt3(cw['wOBA'])}（{cw['打席']} 打席）を、"
+                   f"全体の wOBA {cw['全体']:.3f} へ {C_COND} 打席分寄せて **{cw['w']:.3f}** を使います。"
+                   '2026年のデータでは、走者・アウト・得点圏・対戦球団で絞っても予測はほとんど良くなりません'
+                   '（打席が少なく偶然の影響が大きいため）。')
+
     # ---- 1場面の予測結果（打者タイプ × 投手タイプの相性モデル） ----
     weights = team_w if pitcher == ALL_P else {pitcher: 1.0}
-    res = predict_type_one(re24, type_model, batter_id, weights, out, runner, batter_form, pitcher_form)
+    res = predict_type_one(re24, type_model, batter_id, weights, out, runner, batter_form, pitcher_form,
+                           cw['w'] if cw else None)
     if batter_id is None:
         st.warning(f'※ {batter} は一球速報に打席がないため、打者 wOBA はリーグ平均として計算しています。')
 
@@ -747,7 +785,7 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     st.caption(
         f"対戦 wOBA 予測 = 打者 wOBA {res['打者wOBA']:.3f} ＋ 投手補正 {res['投手補正']:+.3f} "
         f"＋ 相性補正 {res['相性補正']:+.3f} = **{res['対戦wOBA予測']:.3f}**　"
-        f"（打者 wOBA は一球速報 {res['打者打席']} 打席をリーグ平均へ収縮）"
+        + ("（打者 wOBA は条件別 wOBA）" if cw else f"（打者 wOBA は一球速報 {res['打者打席']} 打席をリーグ平均へ収縮）")
     )
     if res['基礎RE24'] is not None and res['補正後期待得点'] is not None:
         st.caption(
@@ -808,7 +846,9 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     # ---- 全24場面 ----
     vs_label = opponent if pitcher == ALL_P else f"{opponent}・{tp.loc[pitcher, '選手名']}"
     st.subheader(f'📋 {batter} vs {vs_label} — 全 24 場面')
-    df_all = predict_type_all(re24, type_model, batter_id, weights, batter_form, pitcher_form)
+    w_fn = ((lambda o, r: conditional_batter_woba(type_model, batter_id, _conds(o, r))['w'])
+            if cond_keys and batter_id else None)
+    df_all = predict_type_all(re24, type_model, batter_id, weights, batter_form, pitcher_form, w_fn)
     tab_chart, tab_table = st.tabs(['グラフ', 'テーブル'])
     with tab_chart:
         st.plotly_chart(plot_24_bar(df_all, batter, vs_label), width='stretch')

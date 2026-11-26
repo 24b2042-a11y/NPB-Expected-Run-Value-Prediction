@@ -1056,7 +1056,8 @@ def type_features(df: pd.DataFrame, model: dict, df_players: pd.DataFrame | None
 
 
 def type_matchup_ability(model: dict, batter_id, pitcher_weights: dict | None = None,
-                         batter_form: str = '普通', pitcher_form: str = '普通') -> dict:
+                         batter_form: str = '普通', pitcher_form: str = '普通',
+                         batter_w: float | None = None) -> dict:
     """
     打者の能力 w を、対戦投手（または投手の集まり）に合わせて計算する。
       pitcher_weights: {投手ID: 重み}。1人なら {ID: 1}。None なら投手を考えない（打者だけ）
@@ -1071,6 +1072,8 @@ def type_matchup_ability(model: dict, batter_id, pitcher_weights: dict | None = 
         power, bats = bool(brow['長打型']), brow.get('打')
     else:
         w_b, pa, power, bats = lg, 0, None, None
+    if batter_w is not None:   # 条件別 wOBA（conditional_batter_woba）で置き換える
+        w_b = float(batter_w)
     # 調子: 好調なら打者 wOBA を FORM_RATE 割増し、不調なら割引き
     w_b *= 1 + FORM_RATE * FORM_SIGN.get(batter_form, 0)
     p_mult = 1 - FORM_RATE * FORM_SIGN.get(pitcher_form, 0)   # 投手が好調なら被 wOBA を割引き
@@ -1133,10 +1136,11 @@ def team_pitcher_weights(model: dict, team: str) -> dict:
 
 
 def predict_type_one(re24: pd.DataFrame, model: dict, batter_id, pitcher_weights: dict | None,
-                     out: int, runner: str, batter_form: str = '普通', pitcher_form: str = '普通') -> dict:
-    """1場面の予測（足し算の形）。補正後期待得点 = RE24 + k × (w − lg)"""
+                     out: int, runner: str, batter_form: str = '普通', pitcher_form: str = '普通',
+                     batter_w: float | None = None) -> dict:
+    """1場面の予測（足し算の形）。補正後期待得点 = RE24 + k × (w − lg)。batter_w で打者 wOBA を置き換えられる"""
     base_re = re24.iloc[out, RUNNER_MAP.get(runner, 0)]
-    a = type_matchup_ability(model, batter_id, pitcher_weights, batter_form, pitcher_form)
+    a = type_matchup_ability(model, batter_id, pitcher_weights, batter_form, pitcher_form, batter_w)
     adj = base_re + model['k'] * (a['w'] - model['lg']) if not np.isnan(base_re) else np.nan
     return {'アウト': out, 'ランナー': runner if runner else '走者なし',
             '打者wOBA': round(a['打者wOBA'], 3), '投手補正': round(a['投手補正'], 3),
@@ -1160,8 +1164,10 @@ def find_batter_id(model: dict | None, batter_name: str) -> str | None:
 
 
 def predict_type_all(re24, model, batter_id, pitcher_weights,
-                     batter_form: str = '普通', pitcher_form: str = '普通') -> pd.DataFrame:
-    return pd.DataFrame([predict_type_one(re24, model, batter_id, pitcher_weights, o, r, batter_form, pitcher_form)
+                     batter_form: str = '普通', pitcher_form: str = '普通', batter_w_fn=None) -> pd.DataFrame:
+    """全24場面。batter_w_fn(out, runner) を渡すと、場面ごとに打者 wOBA を置き換える（条件別 wOBA）"""
+    return pd.DataFrame([predict_type_one(re24, model, batter_id, pitcher_weights, o, r, batter_form, pitcher_form,
+                                          batter_w_fn(o, r) if batter_w_fn else None)
                          for o in range(3) for r in RUNNER_LABEL])
 
 
@@ -1337,3 +1343,38 @@ def woba_breakdown(pa: pd.DataFrame, by: str) -> pd.DataFrame:
         r.update(woba_stats(g))
         rows.append(r)
     return pd.DataFrame(rows)
+
+
+
+# ============================================================
+# Step 11: メインの予測で使う条件別 wOBA（2026-11-26）
+#   打者の wOBA を「いまの条件」（走者・アウト・対戦球団・ホーム/ビジター など）での成績に置き換える。
+#   条件で絞ると打席が少なくなるので、打者の全体 wOBA（相性モデルの収縮後）へ C_COND 打席分収縮する。
+#     条件別 wOBA = (条件での wOBA 分子 + C_COND × 全体 wOBA) / (条件での分母 + C_COND)
+#   検証（validate.py）では、走者・得点圏・アウト・対戦球団の条件を入れても予測はほぼ変わらない
+#   （C=200 で RE24 だけとの差の改善は ±0.0002 以内）。ホーム/ビジターはポストシーズンでわずかに改善。
+# ============================================================
+C_COND = 200
+COND_COLUMNS = {'走者': '走者', '得点圏': '得点圏', 'アウト': 'アウト', '対戦球団': '投手球団',
+                'ホーム/ビジター': 'ホーム/ビジター'}
+
+
+def conditional_batter_woba(model: dict, batter_id, conds: dict, c: float = C_COND) -> dict:
+    """
+    conds: {'走者': '1,2塁', 'アウト': 1, '対戦球団': '巨人', 'ホーム/ビジター': 'ホーム', '得点圏': True} の一部
+    レギュラーシーズンの打席だけを使う。Returns: w（収縮後）, 生の wOBA, 打席, 全体 wOBA
+    """
+    pa = model.get('pa')
+    bid = normalize_player_id(batter_id)
+    base = float(model['batters']['w'].get(bid, model['lg']))
+    if pa is None or bid is None:
+        return {'w': base, 'wOBA': np.nan, '打席': 0, '全体': base}
+    d = pa[(pa['打者ID'] == bid) & (pa['区分'] == 'レギュラーシーズン')]
+    for k, v in conds.items():
+        if k == '得点圏':
+            d = d[d['走者'].isin(RISP_BITS) == bool(v)]
+        else:
+            d = d[d[COND_COLUMNS[k]] == v]
+    num, den = float(d['woba_num'].sum()), float(d['woba_den'].sum())
+    return {'w': (num + c * base) / (den + c), 'wOBA': num / den if den else np.nan,
+            '打席': int(den), '全体': base}

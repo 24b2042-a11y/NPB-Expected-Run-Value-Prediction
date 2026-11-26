@@ -348,6 +348,28 @@ def run(split: str = 'postseason', test_frac: float = 0.2, woba_source: str = 'p
                 else:
                     d[f'w_型:打者+投手+相性{tag}'] = f['tm_打者'] + f['tm_投手'] + f['tm_相性']
 
+        # --- 条件別 wOBA（打者の wOBA を「いまの条件」での成績に置き換える。全体 wOBA へ C_COND 打席分収縮）---
+        tm0 = core.build_type_model(df_train, pl_all, re24)
+        tr = core.add_woba_columns(df_train)
+        for d in (tr, df_train, df_test):
+            d['_bid'] = d['打者ID'].apply(core.normalize_player_id)
+            d['_走者'] = d['ランナー'].fillna('').replace('', '走者なし')
+            d['_得点圏'] = d['_走者'].isin(core.RISP_BITS)
+            d['_HV'] = np.where(d['イニング'].astype(str).str.contains('表'), 'V', 'H')
+        conds = {'走者': ['_走者'], '得点圏': ['_得点圏'], 'アウト': ['アウト'], '対戦球団': ['対戦球団'],
+                 'ホーム/ビジター': ['_HV'], '得点圏×アウト': ['_得点圏', 'アウト']}
+        for d in (df_train, df_test):
+            f = core.type_features(d, tm0, pl_all)
+            d['_wb'], d['_pe'], d['_me'] = f['tm_打者'], f['tm_投手'], f['tm_相性']
+        for cname, cols in conds.items():
+            g = tr.groupby(['_bid'] + cols).agg(num=('woba_num', 'sum'), den=('woba_den', 'sum')).reset_index()
+            for c_cond in (50, 200, 1000):
+                for d in (df_train, df_test):
+                    m = d[['_bid'] + cols].merge(g, on=['_bid'] + cols, how='left')
+                    num, den = m['num'].fillna(0).to_numpy(), m['den'].fillna(0).to_numpy()
+                    wb = d['_wb'].to_numpy()
+                    d[f'w_条件:{cname}C{c_cond}'] = (num + c_cond * wb) / (den + c_cond) + d['_pe'] + d['_me']
+
     known = set(df_woba['選手名_key'])
     match_rate = float(df_test['batter_key'].isin(known).mean())
 
