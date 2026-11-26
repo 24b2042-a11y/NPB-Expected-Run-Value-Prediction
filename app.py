@@ -20,7 +20,8 @@ import importlib
 # 新しく追加した名前を import すると ImportError になるため、自作モジュールは毎回
 # 読み込み直す（scraper → core → github_sync → player_scraper の依存順）。
 import scraper as _scraper, core as _core, github_sync as _github_sync, player_scraper as _player_scraper
-for _m in (_scraper, _core, _github_sync, _player_scraper):
+import game_sim as _game_sim
+for _m in (_scraper, _core, _game_sim, _github_sync, _player_scraper):
     importlib.reload(_m)
 
 # st.cache_data のキャッシュは「キャッシュする関数のコード」と引数で判定されるため、
@@ -28,15 +29,16 @@ for _m in (_scraper, _core, _github_sync, _player_scraper):
 # core.py などの中身のハッシュを引数として渡し、自作モジュールが変わったらキャッシュを作り直す。
 import hashlib
 CODE_VERSION = hashlib.md5(b''.join(
-    open(_m.__file__, 'rb').read() for _m in (_scraper, _core, _github_sync, _player_scraper)
+    open(_m.__file__, 'rb').read() for _m in (_scraper, _core, _game_sim, _github_sync, _player_scraper)
 )).hexdigest()[:12]
 
 from core import (
     build_model_from_dfs, predict_type_one, predict_type_all, find_batter_id, team_pitcher_weights,
     get_player_career, get_player_current_team, get_team_avg_runs,
     normalize_name, normalize_team_name, build_batter_woba, build_season_batting,
-    RUNNER_LABEL, RUNNER_MAP,
+    RUNNER_LABEL, RUNNER_MAP, FORM_LEVELS, FORM_RATE, form_of,
 )
+import game_sim
 # build_model_from_dfs の戻り値に df_team_batting_stats（対戦球団ごとの
 # 打率・得点期待値）と df_situational_stats（状況別の打率・得点期待値）が
 # 追加されたのに合わせて main() 側の unpack と page_main() の引数を拡張。
@@ -601,6 +603,17 @@ def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers, df_seas
 # ============================================================
 # メインページ: 得点期待値予測 + 選手個人成績
 # ============================================================
+def _form_caption(f: dict | None, role: str) -> str:
+    """直近の成績からの調子の判定を1行で"""
+    if not f:
+        return '直近の成績: データなし'
+    unit = '試合' if role == '打者' else '登板'
+    label = 'wOBA' if role == '打者' else '被wOBA'
+    rec = f"{f['直近wOBA']:.3f}" if pd.notna(f['直近wOBA']) else '—'
+    return (f"直近 {int(f['直近試合数'])} {unit}（{int(f['直近打席'])} 打席）の{label} {rec}"
+            f"／シーズン {f['シーズンwOBA']:.3f} → 判定: **{f['調子']}**（選んだときだけ使います）")
+
+
 def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
               df_team_batting_stats, df_situational_stats, df_pitchers=None, df_season=None,
               type_model=None):
@@ -670,12 +683,30 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     runner = RUNNER_STR_MAP[(r1, r2, r3)]
     st.caption(f'選択中: **{runner}**')
 
+    # ---- 調子（既定は普通。直近の成績からの判定は参考に表示） ----
+    st.markdown('**調子**')
+    batter_id = find_batter_id(type_model, batter)
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        batter_form = st.radio(f'打者（{batter}）', FORM_LEVELS, index=1, horizontal=True, key='batter_form')
+        st.caption(_form_caption(form_of(type_model.get('form'), '打者', batter_id), '打者'))
+    with fc2:
+        if pitcher == ALL_P:
+            pitcher_form = st.radio(f'{opponent} の投手陣', FORM_LEVELS, index=1, horizontal=True,
+                                    key='pitcher_form')
+            st.caption('投手を選ぶと、直近の登板からの判定を表示します。')
+        else:
+            pitcher_form = st.radio(f"投手（{tp.loc[pitcher, '選手名']}）", FORM_LEVELS, index=1,
+                                    horizontal=True, key='pitcher_form')
+            st.caption(_form_caption(form_of(type_model.get('form'), '投手', pitcher), '投手'))
+    st.caption(f'好調・不調は打者の wOBA（投手は被 wOBA）を ±{FORM_RATE:.0%} 補正します。'
+               '2026年のデータでは、直近の調子が次の試合の成績を当てる効果は確認できていません（参考機能）。')
+
     st.divider()
 
     # ---- 1場面の予測結果（打者タイプ × 投手タイプの相性モデル） ----
-    batter_id = find_batter_id(type_model, batter)
     weights = team_w if pitcher == ALL_P else {pitcher: 1.0}
-    res = predict_type_one(re24, type_model, batter_id, weights, out, runner)
+    res = predict_type_one(re24, type_model, batter_id, weights, out, runner, batter_form, pitcher_form)
     if batter_id is None:
         st.warning(f'※ {batter} は一球速報に打席がないため、打者 wOBA はリーグ平均として計算しています。')
 
@@ -700,6 +731,13 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     t3.metric(f'{opponent} の1試合平均得点',
               f'{avg_runs:.2f}' if avg_runs is not None else 'N/A',
               help=f'集計試合数: {n_team_games} 試合' if n_team_games else 'データなし')
+
+    # ---- 投手の成績（予測の「投手補正」の元） ----
+    if pitcher != ALL_P:
+        pr = tp.loc[pitcher]
+        velo = f"{pr['速球']:.1f} km/h" if pd.notna(pr['速球']) else '—'
+        st.caption(f"投手 {pr['選手名']}: 対戦打者 {int(pr['対戦打者'])}、被 wOBA {pr['被wOBA']:.3f}"
+                   f"（リーグ平均へ収縮後 {pr['w']:.3f}）、奪三振率 {pr['K%']:.1%}、速球の平均 {velo}")
 
     # ---- 計算の内訳 ----
     st.caption(
@@ -766,7 +804,7 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     # ---- 全24場面 ----
     vs_label = opponent if pitcher == ALL_P else f"{opponent}・{tp.loc[pitcher, '選手名']}"
     st.subheader(f'📋 {batter} vs {vs_label} — 全 24 場面')
-    df_all = predict_type_all(re24, type_model, batter_id, weights)
+    df_all = predict_type_all(re24, type_model, batter_id, weights, batter_form, pitcher_form)
     tab_chart, tab_table = st.tabs(['グラフ', 'テーブル'])
     with tab_chart:
         st.plotly_chart(plot_24_bar(df_all, batter, vs_label), width='stretch')
@@ -1299,6 +1337,123 @@ def page_settings(gh_cfg):
 # ============================================================
 # メイン
 # ============================================================
+# 試合シミュレーションページ（game_sim.py）
+# ============================================================
+SIM_TEAMS = ['巨人', 'ヤクルト', 'ＤｅＮＡ', '中日', '阪神', '広島',
+             'ソフトバンク', '日本ハム', 'オリックス', '楽天', '西武', 'ロッテ']
+
+
+def _sim_team_inputs(sim, type_model, side: str, label: str, team_default: int, auto_form: bool):
+    """片方のチームのスタメン・先発・調子の入力欄。{'team', 'lineup', 'sp', 'batter_forms', 'sp_form'} を返す"""
+    teams = [t for t in SIM_TEAMS if t in sim['team_starters']] or sorted(sim['team_starters'])
+    names = sim['names']
+    forms = type_model.get('form')
+    st.markdown(f'#### {label}')
+    team = st.selectbox('球団', teams, index=min(team_default, len(teams) - 1), key=f'sim_team_{side}')
+
+    sps = list(sim['team_starters'].get(team, {}))
+    def _sp_label(pid):
+        n = sim['team_starters'][team][pid]
+        return f"{names.get(pid, pid)}（先発 {n} 試合）"
+    sp = st.selectbox('先発投手', sps, format_func=_sp_label, key=f'sim_sp_{side}_{team}')
+    sp_auto = (form_of(forms, '投手', sp) or {}).get('調子', '普通')
+    sp_form = st.radio('先発の調子', FORM_LEVELS, index=FORM_LEVELS.index(sp_auto if auto_form else '普通'),
+                       horizontal=True, key=f'sim_spform_{side}_{team}_{sp}_{auto_form}')
+
+    batters = game_sim.team_batters(sim, team)
+    default = game_sim.last_lineup(sim, team) or batters[:9]
+    st.caption('打順（既定は今季最後の試合のスタメン）')
+    lineup, bforms = [], []
+    for i in range(9):
+        c1, c2 = st.columns([3, 2])
+        opts = batters if default[i] in batters else [default[i]] + batters
+        with c1:
+            pid = st.selectbox(f'{i + 1}番', opts, index=opts.index(default[i]),
+                               format_func=lambda x: names.get(x, x), key=f'sim_bat_{side}_{team}_{i}')
+        auto = (form_of(forms, '打者', pid) or {}).get('調子', '普通')
+        with c2:
+            f = st.selectbox('調子', FORM_LEVELS, index=FORM_LEVELS.index(auto if auto_form else '普通'),
+                             key=f'sim_bform_{side}_{team}_{i}_{pid}_{auto_form}', label_visibility='collapsed')
+        lineup.append(pid)
+        bforms.append(f)
+    return {'team': team, 'lineup': lineup, 'sp': sp, 'batter_forms': bforms, 'sp_form': sp_form}
+
+
+def page_simulation(type_model):
+    st.title('🎮 試合シミュレーション')
+    if type_model is None or 'sim' not in type_model:
+        st.error('シミュレーション用のモデルを作れませんでした（打席データに打者ID・投手ID の列がありません）。')
+        return
+    sim = type_model['sim']
+    st.caption('スタメンと先発投手を入れると、1打席ずつの結果を確率で引いて試合を何度も繰り返し、勝率と予想スコアを出します。'
+               '打者・投手の今季の成績（三振・四死球・単打・長打・本塁打の割合）、打者タイプ × 投手タイプの相性、'
+               '調子を使います。先発は今季の先発での対戦打者数で降板し、その後はチームの救援陣が投げます。')
+
+    auto_form = st.toggle('調子を直近の成績から自動で設定する（オフ = 全員「普通」）', value=False, key='sim_auto_form')
+    ca, ch = st.columns(2)
+    with ca:
+        away = _sim_team_inputs(sim, type_model, 'away', 'ビジター（先攻）', 4, auto_form)
+    with ch:
+        home = _sim_team_inputs(sim, type_model, 'home', 'ホーム（後攻）', 0, auto_form)
+
+    n = st.select_slider('シミュレーション回数', [200, 500, 1000, 2000, 5000], value=1000, key='sim_n')
+    if away['team'] == home['team']:
+        st.warning('同じ球団同士になっています。')
+    if st.button('▶ シミュレーション開始', type='primary', key='sim_run'):
+        with st.spinner(f'{n} 試合をシミュレーション中...'):
+            st.session_state['sim_result'] = (game_sim.simulate_many(sim, away, home, n=n, seed=None), away, home)
+
+    if 'sim_result' not in st.session_state:
+        return
+    r, away, home = st.session_state['sim_result']
+    a, h = away['team'], home['team']
+    st.divider()
+    st.subheader('📊 結果')
+    m1, m2, m3 = st.columns(3)
+    m1.metric(f'{a} の勝率', f"{r['勝率']['away']:.1%}")
+    m2.metric(f'{h} の勝率', f"{r['勝率']['home']:.1%}")
+    m3.metric('引き分け（12回）', f"{r['勝率']['引き分け']:.1%}")
+    s1, s2 = st.columns(2)
+    s1.metric(f'{a} の平均得点', f"{r['平均得点']['away']:.2f}")
+    s2.metric(f'{h} の平均得点', f"{r['平均得点']['home']:.2f}")
+
+    dist = pd.DataFrame({a: r['得点分布']['away'], h: r['得点分布']['home']}).fillna(0).sort_index()
+    fig = go.Figure([go.Bar(name=a, x=dist.index, y=dist[a]), go.Bar(name=h, x=dist.index, y=dist[h])])
+    fig.update_layout(barmode='group', title='得点の分布', xaxis_title='得点', yaxis_title='割合',
+                      yaxis_tickformat='.0%', height=360, margin=dict(l=20, r=20, t=50, b=40))
+    st.plotly_chart(fig, width='stretch')
+
+    top = r['スコア'].reset_index()
+    top.columns = [a, h, '確率']
+    top['確率'] = top['確率'].map(lambda v: f'{v:.1%}')
+    st.markdown('**よく出たスコア**')
+    st.dataframe(top, width='stretch', hide_index=True)
+
+    inn = pd.DataFrame({a: r['イニング平均']['away'], h: r['イニング平均']['home']},
+                       index=[f'{i}回' for i in range(1, 10)]).T.round(2)
+    st.markdown('**イニングごとの平均得点**')
+    st.dataframe(inn, width='stretch')
+
+    st.divider()
+    st.subheader('📝 1試合の流れ（シミュレーションの1回分）')
+    smp = r['サンプル']
+    cols = [f'{i}' for i in range(1, max(len(smp['line']['away']), len(smp['line']['home'])) + 1)]
+    ls = pd.DataFrame([smp['line']['away'] + [None] * (len(cols) - len(smp['line']['away'])),
+                       smp['line']['home'] + [None] * (len(cols) - len(smp['line']['home']))],
+                      index=[a, h], columns=cols)
+    ls = ls.map(lambda v: 'X' if v is None or (isinstance(v, float) and np.isnan(v)) else int(v))
+    ls['計'] = [smp['away'], smp['home']]
+    st.dataframe(ls, width='stretch')
+    log = pd.DataFrame(smp['log'])
+    log['攻撃'] = np.where(log['表裏'] == '表', a, h)
+    st.dataframe(log[['回', '表裏', '攻撃', '打順', '打者', '投手', 'アウト', '走者', '結果', '得点', 'スコア']],
+                 width='stretch', height=420, hide_index=True)
+    st.caption('※ 結果は「三振・凡退・四死球・単打・二塁打・三塁打・本塁打」の7種類。走者の進み方（併殺・進塁打・盗塁など）は'
+               '今季の一球速報で同じ状況・同じ結果のときに実際に起きたことから引いています。代打・守備交代・救援投手の個別の起用は'
+               '入れていません。')
+
+
+# ============================================================
 def main():
     gh_cfg = get_github_cfg()
 
@@ -1311,7 +1466,7 @@ def main():
         st.markdown('## ⚾ NPB 得点期待値')
         st.divider()
 
-        page_options = ['🔮 メイン（予測）', '👥 選手成績', '⚙️ 設定（データ更新）']
+        page_options = ['🔮 メイン（予測）', '🎮 試合シミュレーション', '👥 選手成績', '⚙️ 設定（データ更新）']
         try:
             default_idx = page_options.index(st.session_state['current_page'])
         except ValueError:
@@ -1332,7 +1487,7 @@ def main():
 
     current = st.session_state['current_page']
 
-    if current in ('🔮 メイン（予測）', '👥 選手成績'):
+    if current in ('🔮 メイン（予測）', '🎮 試合シミュレーション', '👥 選手成績'):
         if gh_cfg:
             src = (gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
         else:
@@ -1344,7 +1499,9 @@ def main():
         df_pitchers = load_pitchers(*src, code_version=CODE_VERSION)
         df_season   = load_season_batting(*src, code_version=CODE_VERSION)
 
-        if current == '🔮 メイン（予測）':
+        if current == '🎮 試合シミュレーション':
+            page_simulation(type_model)
+        elif current == '🔮 メイン（予測）':
             if n_games == 0:
                 st.info('試合データがありません。サイドバーから「⚙️ 設定」を選択して取得してください。')
                 st.stop()

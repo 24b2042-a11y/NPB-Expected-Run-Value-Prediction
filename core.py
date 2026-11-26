@@ -122,12 +122,14 @@ RESULT_PATTERNS = [
     ('2B',  re.compile(r'二塁打|ツーベース')),
     ('IBB', re.compile(r'敬遠')),
     ('BB',  re.compile(r'四球|フォアボール')),
-    ('HBP', re.compile(r'死球')),
-    ('SO',  re.compile(r'三振')),
+    ('HBP', re.compile(r'死球|デッドボール')),
+    ('SO',  re.compile(r'三振|振り逃げ')),
     ('1B',  re.compile(r'ヒット|安打')),
     ('SF',  re.compile(r'犠飛|犠牲フライ')),
     ('SAC', re.compile(r'バント')),
-    ('OUT', re.compile(r'ゴロ|フライ|ライナー|失策|エラー|併殺')),
+    # 併殺は「ダブルプレー」、失策出塁は「悪送球」「ファンブル」「後逸」などと書かれる（2026-11-26 追加）。
+    # 失策での出塁は wOBA の慣例どおり凡退として数える
+    ('OUT', re.compile(r'ゴロ|フライ|邪飛|ライナー|失策|エラー|併殺|ダブルプレー|トリプルプレー|悪送球|ファンブル|後逸|落球|野選|フィルダースチョイス|打撃妨害|守備妨害')),
 ]
 
 # 安打として扱う結果コード
@@ -168,8 +170,11 @@ def add_result_columns(df_runs: pd.DataFrame) -> pd.DataFrame:
     df['結果']   = df['本文'].apply(classify_result)
     df['is_hit'] = df['結果'].isin(HIT_CODES)
     df['is_ab']  = (~df['結果'].isin(NON_AB_CODES)) & (df['結果'] != 'UNKNOWN')
-    df['対戦球団_raw'] = df.apply(_opponent_team_raw, axis=1)
-    df['対戦球団']     = df['対戦球団_raw'].apply(normalize_team_name)
+    # 裏 = ホームの攻撃なので対戦相手はアウェイ（_opponent_team_raw と同じ判定を列で計算）
+    is_bottom = df['イニング'].astype(str).str.contains('裏')
+    df['対戦球団_raw'] = df['away_team_raw'].where(is_bottom, df['home_team_raw'])
+    team_map = {t: normalize_team_name(t) for t in df['対戦球団_raw'].dropna().unique()}
+    df['対戦球団']     = df['対戦球団_raw'].map(team_map)
     return df
 
 
@@ -201,59 +206,45 @@ def _inning_sort_key(inning_str) -> tuple[int, int]:
 
 
 def calc_runs_after(all_df: pd.DataFrame) -> pd.DataFrame:
-    results = []
-    for game_id, game_grp in all_df.groupby('game_id'):
-        # 半イニングを試合内の時系列順（イニング番号→表/裏）に並べる。
-        # 得点の累計（carry_score）をイニングをまたいで引き継ぐために、
-        # 出現順ではなく明示的に時系列でソートする必要がある。
-        inning_order = sorted(game_grp['イニング'].unique(), key=_inning_sort_key)
+    """
+    各打席に「その打席からイニング終了までに入った得点（runs_after）」を付ける。
 
-        carry_score = 0  # この試合でそれまでに記録された総得点（両チーム合計）
-        for inning in inning_order:
-            grp = game_grp[game_grp['イニング'] == inning].sort_values('打席順').reset_index(drop=True)
+    本文の得点表記（例: 広 3-5 ロ）から両チーム合計の得点を読み、試合の中で時系列（イニング番号→表/裏→打席順）に
+    並べて前の打席との差（その打席で入った得点）を出し、半イニングの中で後ろから足し上げる。
+    得点表記のない打席は直前の得点のまま（差 0）。各半イニングの起点は、それまでの試合の得点。
+    （2026-11-26 に行ごとのループをやめて列の計算に書き直した。結果は以前の実装と同じ）
+    """
+    if all_df.empty:
+        return pd.DataFrame(columns=['game_id', 'イニング', '打席順', '打順', '選手名', 'アウト', 'ランナー', '本文',
+                                     'runs_after', 'home_team_raw', 'away_team_raw', *DETAIL_EXTRA_COLS])
+    df = all_df.copy()
+    for c in ('打順', 'home_team_raw', 'away_team_raw', *DETAIL_EXTRA_COLS):
+        if c not in df.columns:
+            df[c] = None
+    key = df['イニング'].map(_inning_sort_key)
+    df['_inn_no'] = key.map(lambda k: k[0])
+    df['_inn_tb'] = key.map(lambda k: k[1])
+    df = df.sort_values(['game_id', '_inn_no', '_inn_tb', '打席順'], kind='stable').reset_index(drop=True)
 
-            score_after, last_score = [None] * len(grp), None
-            for i, body in enumerate(grp['本文'].fillna('')):
-                m = find_last_score(body)
-                if m:
-                    last_score = int(m.group(1)) + int(m.group(2))
-                score_after[i] = last_score
+    # 本文の最後の得点表記 → 両チーム合計。なければ NaN にして、試合の中で直前の値（最初は 0）で埋める
+    def _total(body):
+        m = find_last_score(body)
+        return int(m.group(1)) + int(m.group(2)) if m else np.nan
+    score = df['本文'].fillna('').map(_total)
+    cur = score.groupby(df['game_id']).ffill().fillna(0)
+    prev = cur.groupby(df['game_id']).shift(1).fillna(0)
+    delta = cur - prev
 
-            # このイニング開始前の得点（carry_score）を起点に増分（delta）を求める。
-            # 以前は各イニングの起点を常に 0 としていたため、そのイニングの
-            # 先頭打者（＝必ず 0アウト・走者なしの場面）に、それ以前の試合の
-            # 総得点がまるごと加算されてしまい、RE24（特に 0アウト・走者なし）
-            # の値が異常に高くなる不具合があった。
-            delta, prev = [], carry_score
-            for s in score_after:
-                cur = s if s is not None else prev
-                delta.append(cur - prev)
-                prev = cur
+    # 半イニングの中で後ろから累積和
+    half = [df['game_id'], df['_inn_no'], df['_inn_tb']]
+    df['runs_after'] = delta[::-1].groupby([h[::-1] for h in half]).cumsum()[::-1].astype(int)
 
-            suffix = np.cumsum(delta[::-1])[::-1]
-
-            # 次の半イニングの起点用に、このイニングの最終得点を引き継ぐ
-            carry_score = prev
-
-            home_raw = grp['home_team_raw'].iloc[0] if 'home_team_raw' in grp.columns else None
-            away_raw = grp['away_team_raw'].iloc[0] if 'away_team_raw' in grp.columns else None
-
-            for i, (_, row) in enumerate(grp.iterrows()):
-                results.append({
-                    'game_id':       game_id,
-                    'イニング':      inning,
-                    '打席順':        row['打席順'],
-                    '選手名':        row['選手名'],
-                    'アウト':        row['アウト'],
-                    'ランナー':      row['ランナー'],
-                    '本文':          row['本文'],
-                    'runs_after':    int(suffix[i]),
-                    'home_team_raw': home_raw,
-                    'away_team_raw': away_raw,
-                    # 打者ID・投手ID など（scraper.EXTRA_COLS）。旧形式の CSV では None
-                    **{c: row.get(c) for c in DETAIL_EXTRA_COLS},
-                })
-    return pd.DataFrame(results)
+    # 半イニング内の home/away は先頭行の値（従来どおり）
+    for c in ('home_team_raw', 'away_team_raw'):
+        df[c] = df.groupby(half)[c].transform('first')
+    cols = ['game_id', 'イニング', '打席順', '打順', '選手名', 'アウト', 'ランナー', '本文',
+            'runs_after', 'home_team_raw', 'away_team_raw', *DETAIL_EXTRA_COLS]
+    return df[cols].reset_index(drop=True)
 
 
 # ============================================================
@@ -792,11 +783,16 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats
     batter_df: 対戦相手別・球場別打撃成績（all_batters_situational.csv 相当）の DataFrame
     stats_dir: 過去3年成績 CSV が入っているディレクトリ（任意）
     """
+    # 調子の判定はポストシーズンも含めた直近の試合で行う（オールスターだけ除く）
+    dfs_recent = [d for d in dfs if 'game_id' in d.columns and len(d)
+                  and int(d['game_id'].iloc[0]) not in ALLSTAR_IDS]
     # オールスター・ポストシーズンは RE24 などの計算から除く
     dfs = [d for d in dfs if 'game_id' not in d.columns or len(d) == 0 or is_regular_season(d['game_id'].iloc[0])]
     if dfs:
         all_df   = concat_details(dfs)
-        df_runs  = calc_runs_after(all_df)
+        # calc_runs_after は時間がかかるので、ポストシーズンも含めて1回だけ計算し、レギュラーシーズン分を取り出す
+        runs_recent = calc_runs_after(concat_details(dfs_recent))
+        df_runs  = runs_recent[runs_recent['game_id'].map(is_regular_season)].reset_index(drop=True)
         re24, counts = build_re24(df_runs)
         df_team_runs = build_team_game_runs(df_runs)
         df_team_batting_stats  = build_team_batting_stats(df_runs)
@@ -806,6 +802,11 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats
         type_model = (build_type_model(df_runs, df_players, re24)
                       if {'打者ID', '投手ID'}.issubset(df_runs.columns) and df_runs['投手ID'].notna().any()
                       else None)
+        if type_model is not None:
+            # 調子の判定表と、試合シミュレーション用のモデル（game_sim.py）も一緒に作っておく
+            from game_sim import build_sim_model   # game_sim は core を import するので、ここで読み込む
+            type_model['form'] = build_form_table(runs_recent, type_model)
+            type_model['sim'] = build_sim_model(df_runs, df_players, type_model)
     else:
         re24 = pd.DataFrame(
             np.full((3, 8), np.nan),
@@ -1042,7 +1043,8 @@ def type_features(df: pd.DataFrame, model: dict, df_players: pd.DataFrame | None
     return out
 
 
-def type_matchup_ability(model: dict, batter_id, pitcher_weights: dict | None = None) -> dict:
+def type_matchup_ability(model: dict, batter_id, pitcher_weights: dict | None = None,
+                         batter_form: str = '普通', pitcher_form: str = '普通') -> dict:
     """
     打者の能力 w を、対戦投手（または投手の集まり）に合わせて計算する。
       pitcher_weights: {投手ID: 重み}。1人なら {ID: 1}。None なら投手を考えない（打者だけ）
@@ -1057,6 +1059,9 @@ def type_matchup_ability(model: dict, batter_id, pitcher_weights: dict | None = 
         power, bats = bool(brow['長打型']), brow.get('打')
     else:
         w_b, pa, power, bats = lg, 0, None, None
+    # 調子: 好調なら打者 wOBA を FORM_RATE 割増し、不調なら割引き
+    w_b *= 1 + FORM_RATE * FORM_SIGN.get(batter_form, 0)
+    p_mult = 1 - FORM_RATE * FORM_SIGN.get(pitcher_form, 0)   # 投手が好調なら被 wOBA を割引き
 
     res = {'打者wOBA': w_b, '打者打席': pa, '投手補正': 0.0, '相性補正': 0.0,
            '打者タイプ': None, '投手タイプ': None, '投手': []}
@@ -1071,7 +1076,7 @@ def type_matchup_ability(model: dict, batter_id, pitcher_weights: dict | None = 
         pid = normalize_player_id(pid)
         wt = wt / tot if tot else 0
         prow = p.loc[pid] if pid in p.index else None
-        pe = float(prow['w']) - lg if prow is not None else 0.0
+        pe = float(prow['w']) * p_mult - lg if prow is not None else lg * p_mult - lg
         arm = prow['投'] if prow is not None else None
         fast = bool(prow['速球派']) if prow is not None else None
         bt = _type_for(bats, power, arm)
@@ -1116,10 +1121,10 @@ def team_pitcher_weights(model: dict, team: str) -> dict:
 
 
 def predict_type_one(re24: pd.DataFrame, model: dict, batter_id, pitcher_weights: dict | None,
-                     out: int, runner: str) -> dict:
+                     out: int, runner: str, batter_form: str = '普通', pitcher_form: str = '普通') -> dict:
     """1場面の予測（足し算の形）。補正後期待得点 = RE24 + k × (w − lg)"""
     base_re = re24.iloc[out, RUNNER_MAP.get(runner, 0)]
-    a = type_matchup_ability(model, batter_id, pitcher_weights)
+    a = type_matchup_ability(model, batter_id, pitcher_weights, batter_form, pitcher_form)
     adj = base_re + model['k'] * (a['w'] - model['lg']) if not np.isnan(base_re) else np.nan
     return {'アウト': out, 'ランナー': runner if runner else '走者なし',
             '打者wOBA': round(a['打者wOBA'], 3), '投手補正': round(a['投手補正'], 3),
@@ -1142,6 +1147,72 @@ def find_batter_id(model: dict | None, batter_name: str) -> str | None:
     return hit['打席'].idxmax() if not hit.empty else None
 
 
-def predict_type_all(re24, model, batter_id, pitcher_weights) -> pd.DataFrame:
-    return pd.DataFrame([predict_type_one(re24, model, batter_id, pitcher_weights, o, r)
+def predict_type_all(re24, model, batter_id, pitcher_weights,
+                     batter_form: str = '普通', pitcher_form: str = '普通') -> pd.DataFrame:
+    return pd.DataFrame([predict_type_one(re24, model, batter_id, pitcher_weights, o, r, batter_form, pitcher_form)
                          for o in range(3) for r in RUNNER_LABEL])
+
+
+# ============================================================
+# Step 9: 調子（好調・普通・不調）（2026-11-26）
+#
+#   判定: 直近の試合（打者 10 試合・投手 5 登板）の wOBA（投手は被 wOBA）が、
+#         シーズンの実力（相性モデルの収縮後 wOBA）からどれだけ離れているかを z 値で見る
+#           z = (直近の wOBA 分子 − 直近の分母 × シーズンの wOBA) / (WOBA_PA_SD × √直近の分母)
+#         打者: z ≥ +1 で好調、z ≤ −1 で不調。投手は向きが逆（被 wOBA が低いほど好調）
+#         直近の分母が FORM_MIN_PA 未満なら判定しない（普通）
+#   効き方: 好調で打者 wOBA ×(1 + FORM_RATE)、不調で ×(1 − FORM_RATE)。投手は被 wOBA に逆向きで掛ける
+#   アプリの既定は「普通」（判定結果は参考として表示し、選んだときだけ使う）
+# ============================================================
+FORM_LEVELS = ['不調', '普通', '好調']
+FORM_SIGN = {'不調': -1, '普通': 0, '好調': 1}
+FORM_RATE = 0.10          # 調子による割合補正（ユーザー指定 10〜20% の下限）
+FORM_N_GAMES_BAT = 10     # 打者の「直近」= 出場した直近 10 試合
+FORM_N_GAMES_PIT = 5      # 投手の「直近」= 直近 5 登板
+FORM_MIN_PA = 15          # 判定に必要な最低打席数・対戦打者数
+FORM_Z = 1.0              # 好調・不調の境目（z 値）
+WOBA_PA_SD = 0.50         # 1打席の wOBA の値の標準偏差（2026年の一球速報で 0.496）
+
+
+def build_form_table(df_runs: pd.DataFrame, model: dict, as_of_game_id=None) -> dict:
+    """
+    全打者・全投手の直近の調子を判定する。
+      df_runs: calc_runs_after の出力（オールスターは除いて渡す。ポストシーズンは含めてよい）
+      as_of_game_id: この試合ID より前の試合だけを見る（None なら全試合）
+    Returns: {'打者': DataFrame(index=打者ID), '投手': DataFrame(index=投手ID)}
+             列: 直近試合数, 直近打席, 直近wOBA, シーズンwOBA, z, 調子
+    """
+    df = add_woba_columns(add_result_columns(df_runs))
+    for c in ('打者ID', '投手ID'):
+        df[c] = df[c].apply(normalize_player_id)
+    df['gid'] = df['game_id'].astype(int)
+    if as_of_game_id is not None:
+        df = df[df['gid'] < int(as_of_game_id)]
+    out = {}
+    for role, col, n_games, season, sign in (('打者', '打者ID', FORM_N_GAMES_BAT, model['batters']['w'], 1),
+                                              ('投手', '投手ID', FORM_N_GAMES_PIT, model['pitchers']['w'], -1)):
+        d = df[df[col].notna()]
+        last = (d[['gid', col]].drop_duplicates().sort_values('gid')
+                .groupby(col).tail(n_games))
+        recent = d.merge(last, on=['gid', col])
+        g = recent.groupby(col).agg(直近試合数=('gid', 'nunique'), num=('woba_num', 'sum'),
+                                    直近打席=('woba_den', 'sum'), 最終試合=('gid', 'max'))
+        g['直近wOBA'] = (g['num'] / g['直近打席']).where(g['直近打席'] > 0)
+        g['シーズンwOBA'] = g.index.to_series().map(season).fillna(model['lg'])
+        g['z'] = (g['num'] - g['直近打席'] * g['シーズンwOBA']) / (WOBA_PA_SD * np.sqrt(g['直近打席'].clip(lower=1)))
+        zz = sign * g['z']
+        g['調子'] = np.where(g['直近打席'] < FORM_MIN_PA, '普通',
+                             np.where(zz >= FORM_Z, '好調', np.where(zz <= -FORM_Z, '不調', '普通')))
+        out[role] = g.drop(columns=['num'])
+    return out
+
+
+def form_of(form_table: dict | None, role: str, player_id) -> dict | None:
+    """判定結果の1行を dict で返す（データがなければ None）"""
+    if not form_table:
+        return None
+    t = form_table.get(role)
+    pid = normalize_player_id(player_id)
+    if t is None or pid not in t.index:
+        return None
+    return t.loc[pid].to_dict()

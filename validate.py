@@ -372,6 +372,60 @@ def run(split: str = 'postseason', test_frac: float = 0.2, woba_source: str = 'p
     return out
 
 
+def validate_simulation(n_sims: int = 300, n_regular: int = 200, seed: int = 0) -> pd.DataFrame:
+    """
+    試合シミュレーション（game_sim.py）の検証。
+      モデル（打者・投手の割合、相性、進塁の分布）はレギュラーシーズンで作り、
+      ポストシーズン16試合を実際のスタメン・先発でそれぞれ n_sims 回シミュレーションして実際の結果と比べる。
+      参考として、レギュラーシーズンから n_regular 試合を選んで同じことをする（学習データ内なので当てはまりの確認）。
+    指標: 予測平均得点と実際の得点の差、勝敗のブライアスコア（ホームの勝率予測 vs 実際。引き分けは 0.5）
+          ブライアスコアの基準 = 全試合で「ホーム勝率 = レギュラーシーズンのホーム勝率」と予測した場合
+    """
+    import game_sim
+    dfs = load_details_local()
+    runs = core.calc_runs_after(core.concat_details(dfs))
+    gid = runs['game_id'].astype(int)
+    reg = runs[~gid.isin(POSTSEASON_IDS | ALLSTAR_IDS)]
+    re24, _ = build_re24(reg)
+    pl = pd.read_csv(os.path.join(BASE_DIR, 'data', 'players.csv'), encoding='utf-8-sig',
+                     dtype={'選手ID': str, '背番号': str})
+    tm = core.build_type_model(reg, pl, re24)
+    sim = game_sim.build_sim_model(reg, pl, tm)
+
+    finals = runs.groupby('game_id').apply(_final_score, include_groups=False)
+    reg_finals = finals[~finals.index.astype(int).isin(POSTSEASON_IDS | ALLSTAR_IDS)]
+    home_rate = float(((reg_finals['home'] > reg_finals['away']) + 0.5 * (reg_finals['home'] == reg_finals['away'])).mean())
+
+    rng = np.random.default_rng(seed)
+    reg_ids = sorted(reg['game_id'].unique())
+    pick = list(rng.choice(reg_ids, size=min(n_regular, len(reg_ids)), replace=False))
+    rows = []
+    for label, ids in (('ポストシーズン', sorted(str(g) for g in POSTSEASON_IDS if str(g) in finals.index)),
+                       ('レギュラーシーズン（学習内）', pick)):
+        for g in ids:
+            setup = game_sim.game_setup(runs[runs['game_id'] == g])
+            r = game_sim.simulate_many(sim, setup['away'], setup['home'], n=n_sims, seed=int(g) % 100000)
+            f = finals.loc[g]
+            actual = 1.0 if f['home'] > f['away'] else 0.0 if f['home'] < f['away'] else 0.5
+            p_home = r['勝率']['home'] + 0.5 * r['勝率']['引き分け']
+            rows.append({'区分': label, 'game_id': g, '予測_away': r['平均得点']['away'],
+                         '予測_home': r['平均得点']['home'], '実際_away': f['away'], '実際_home': f['home'],
+                         '予測ホーム勝率': p_home, '実際': actual,
+                         'brier': (p_home - actual) ** 2, 'brier_基準': (home_rate - actual) ** 2})
+    df = pd.DataFrame(rows)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    df.to_csv(os.path.join(RESULTS_DIR, 'simulation_check.csv'), index=False, encoding='utf-8-sig')
+    return df
+
+
+def _final_score(g: pd.DataFrame) -> pd.Series:
+    """試合の最終スコア（半イニングごとの得点 = 最初の打席の runs_after を合計）"""
+    first = g.groupby('イニング', sort=False).head(1)
+    side = np.where(first['イニング'].astype(str).str.contains('表'), 'away', 'home')
+    return pd.Series({'away': int(first.loc[side == 'away', 'runs_after'].sum()),
+                      'home': int(first.loc[side == 'home', 'runs_after'].sum())})
+
+
 def _print(out: dict, top: int) -> None:
     print(f"学習 {out['学習試合']} 試合 / {out['学習打席']:,} 打席　テスト {out['テスト試合']} 試合 / {out['テスト打席']:,} 打席")
     print(f"wOBA の元データ: {out['wOBA元']}　リーグ平均 wOBA {out['リーグ平均wOBA']:.3f}　"
@@ -392,7 +446,17 @@ if __name__ == '__main__':
     ap.add_argument('--c-list', type=str, default=','.join(str(c) for c in DEFAULT_C_LIST))
     ap.add_argument('--n-boot', type=int, default=2000)
     ap.add_argument('--top', type=int, default=8)
+    ap.add_argument('--sim', action='store_true', help='試合シミュレーション（game_sim.py）を検証する')
+    ap.add_argument('--n-sims', type=int, default=300)
     args = ap.parse_args()
+    if args.sim:
+        df = validate_simulation(args.n_sims)
+        for lab, d in df.groupby('区分'):
+            pred = (d['予測_away'] + d['予測_home']).mean()
+            act = (d['実際_away'] + d['実際_home']).mean()
+            print(f"{lab}: {len(d)} 試合　1試合の両軍合計得点 予測 {pred:.2f} / 実際 {act:.2f}　"
+                  f"ブライアスコア {d['brier'].mean():.3f}（基準 {d['brier_基準'].mean():.3f}。小さいほど良い）")
+        raise SystemExit(0)
     o = run(args.split, args.test_frac, args.woba_source,
             [float(c) for c in args.c_list.split(',')], args.n_boot)
     _print(o, args.top)
