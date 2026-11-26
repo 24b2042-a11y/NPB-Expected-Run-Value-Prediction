@@ -1576,7 +1576,7 @@ def page_simulation(type_model):
                       index=[a, h], columns=cols)
     ls = ls.map(lambda v: 'X' if v is None or (isinstance(v, float) and np.isnan(v)) else int(v))
     ls['計'] = [smp['away'], smp['home']]
-    st.dataframe(ls, width='stretch')
+    st.dataframe(ls.astype(str), width='stretch')   # 「X」（9回裏なし）と数字が混ざるので文字列で表示
     log = pd.DataFrame(smp['log'])
     log['攻撃'] = np.where(log['表裏'] == '表', a, h)
     st.dataframe(log[['回', '表裏', '攻撃', '打順', '打者', '投手', 'アウト', '走者', '結果', '得点', 'スコア']],
