@@ -10,6 +10,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import glob
 import plotly.graph_objects as go
 import plotly.express as px
 import importlib
@@ -31,10 +32,10 @@ CODE_VERSION = hashlib.md5(b''.join(
 )).hexdigest()[:12]
 
 from core import (
-    build_model_from_dfs, predict_one, predict_all,
+    build_model_from_dfs, predict_type_one, predict_type_all, find_batter_id, team_pitcher_weights,
     get_player_career, get_player_current_team, get_team_avg_runs,
     normalize_name, normalize_team_name, build_batter_woba, build_season_batting,
-    RUNNER_LABEL, RUNNER_MAP, SHRINK_C,
+    RUNNER_LABEL, RUNNER_MAP,
 )
 # build_model_from_dfs の戻り値に df_team_batting_stats（対戦球団ごとの
 # 打率・得点期待値）と df_situational_stats（状況別の打率・得点期待値）が
@@ -70,7 +71,10 @@ st.set_page_config(
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 BATTER_CSV = os.path.join(BASE_DIR, 'data', 'all_batters_situational.csv')
-STATS_DIR  = os.path.join(BASE_DIR, 'data', '2023~2025打撃データ')
+PITCHER_CSV = os.path.join(BASE_DIR, 'data', 'all_pitchers.csv')
+PLAYERS_CSV = os.path.join(BASE_DIR, 'data', 'players.csv')
+GAMEDATA_DIR = os.path.join(BASE_DIR, 'data', 'gamedata')
+STATS_DIR = os.path.join(BASE_DIR, 'data', '2023~2025打撃データ')
 START_ID   = 2021038624
 CURRENT_SEASON = 2026   # 「今シーズン」として表示する年（nf3 の y=0 = 当年度のデータ）
 
@@ -89,16 +93,47 @@ RUNNER_STR_MAP = {
 # ============================================================
 # キャッシュ
 # ============================================================
+def load_details_local(data_dir: str = GAMEDATA_DIR) -> list[pd.DataFrame]:
+    """
+    data/gamedata/*_details.csv をローカルから読み込む（load_details_from_github のローカル版）。
+    GitHub トークン未設定時に使う。
+    """
+    dfs = []
+    for path in sorted(glob.glob(os.path.join(data_dir, '*_details.csv'))):
+        fname = os.path.basename(path)
+        try:
+            df = pd.read_csv(path, encoding='utf-8-sig')
+        except Exception:
+            continue
+        df['game_id'] = fname.split('_', 1)[0]
+        card = fname.split('_', 1)[1].replace('_details.csv', '')
+        home_raw, away_raw = card.split('vs.', 1) if 'vs.' in card else (None, None)
+        df['home_team_raw'] = home_raw
+        df['away_team_raw'] = away_raw
+        dfs.append(df)
+    return dfs
+
+
 @st.cache_data(show_spinner='データを読み込んでいます...')
-def load_model(token: str, repo_name: str, branch: str, code_version: str = CODE_VERSION):
-    dfs, _ = load_details_from_github(token, repo_name, branch)
+def load_model(token: str | None, repo_name: str | None, branch: str | None, code_version: str = CODE_VERSION):
+    # token が無い（None）ときは GitHub を使わず、リポジトリ同梱のローカル data/ を読む
+    if token:
+        dfs, _ = load_details_from_github(token, repo_name, branch)
+        batter_df = load_batter_csv_from_github(token, repo_name, branch)
+        df_players = load_players_csv_from_github(token, repo_name, branch)
+    else:
+        dfs = load_details_local()
+        batter_df = None
+        df_players = None
+    # 選手マスタ（投打・球速）。打者・投手のタイプ分けに使う
+    if df_players is None and os.path.exists(PLAYERS_CSV):
+        df_players = pd.read_csv(PLAYERS_CSV, encoding='utf-8-sig', dtype={'選手ID': str, '背番号': str})
 
     # 対戦成績CSVはまずGitHub上の最新版を試し、なければリポジトリ同梱のローカル版を使う
-    batter_df = load_batter_csv_from_github(token, repo_name, branch)
     if batter_df is None:
         batter_df = pd.read_csv(BATTER_CSV, encoding='utf-8-sig')
 
-    return build_model_from_dfs(dfs, batter_df, STATS_DIR)
+    return build_model_from_dfs(dfs, batter_df, STATS_DIR, df_players)
 
 
 def reload_model():
@@ -108,15 +143,18 @@ def reload_model():
 
 
 @st.cache_data(show_spinner='投手データを読み込んでいます...')
-def load_pitchers(token: str, repo_name: str, branch: str, code_version: str = CODE_VERSION):
+def load_pitchers(token: str | None, repo_name: str | None, branch: str | None, code_version: str = CODE_VERSION):
     """投手成績CSV（data/all_pitchers.csv）。まだ無い場合は None"""
-    return load_pitcher_csv_from_github(token, repo_name, branch)
+    df = load_pitcher_csv_from_github(token, repo_name, branch) if token else None
+    if df is None and os.path.exists(PITCHER_CSV):
+        df = pd.read_csv(PITCHER_CSV, encoding='utf-8-sig')
+    return df
 
 
 @st.cache_data(show_spinner='今シーズンの成績を集計しています...')
-def load_season_batting(token: str, repo_name: str, branch: str, code_version: str = CODE_VERSION):
+def load_season_batting(token: str | None, repo_name: str | None, branch: str | None, code_version: str = CODE_VERSION):
     """対戦相手別の打者成績CSVを選手×球団ごとに合計した、今シーズンの通算成績"""
-    batter_df = load_batter_csv_from_github(token, repo_name, branch)
+    batter_df = load_batter_csv_from_github(token, repo_name, branch) if token else None
     if batter_df is None:
         batter_df = pd.read_csv(BATTER_CSV, encoding='utf-8-sig')
     return build_season_batting(batter_df)
@@ -125,8 +163,13 @@ def load_season_batting(token: str, repo_name: str, branch: str, code_version: s
 def get_github_cfg() -> dict | None:
     try:
         cfg = st.secrets['github']
+        token = str(cfg['token']).strip()
+        # 未入力やプレースホルダーのままだと HTTP ヘッダーに載せられず
+        # UnicodeEncodeError になるため、未設定として扱う
+        if not token or not token.isascii():
+            return None
         return {
-            'token':     cfg['token'],
+            'token':     token,
             'repo_name': cfg['repo_name'],
             'branch':    cfg.get('branch', 'main'),
         }
@@ -559,13 +602,22 @@ def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers, df_seas
 # メインページ: 得点期待値予測 + 選手個人成績
 # ============================================================
 def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
-              df_team_batting_stats, df_situational_stats, df_pitchers=None, df_season=None):
+              df_team_batting_stats, df_situational_stats, df_pitchers=None, df_season=None,
+              type_model=None):
     st.title('⚾ 得点期待値予測')
-    st.caption(f'使用データ: {n_games} 試合 / {n_pa:,} 打席  |  リーグ平均 wOBA: {league_avg:.3f}')
+    if type_model is None:
+        st.error('相性モデルを作れませんでした（打席データに打者ID・投手ID の列がありません）。'
+                 '「⚙️ 設定」の「既存試合の再取得」を実行してください。')
+        st.stop()
+    lg, k = type_model['lg'], type_model['k']
+    st.caption(f'使用データ: レギュラーシーズン {n_games} 試合 / {n_pa:,} 打席  |  リーグ平均 wOBA: {lg:.3f}')
     st.divider()
 
     # ---- 選手名テキスト入力（インクリメンタルサーチ） ----
-    all_batters = sorted(df_woba['選手名'].unique().tolist())
+    # 一球速報に打席のある打者だけ（nf3 にだけいる打者は投手などで、打席は合計でも20打席に満たない）
+    tm_names = set(type_model['batters']['選手名'].apply(normalize_name)) if type_model is not None else None
+    all_batters = sorted(n for n in df_woba['選手名'].unique().tolist()
+                         if tm_names is None or normalize_name(n) in tm_names)
     query = st.text_input('🔍 選手名を入力', placeholder='例: 田中、鈴木、村上')
 
     if query:
@@ -592,6 +644,19 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     with col_opp:
         opponents = sorted(df_woba['区分名'].unique().tolist())
         opponent  = st.selectbox('対戦相手', opponents, key='opponent_select')
+        # 対戦投手: 相手チームで学習データに登板した投手（対戦打者の多い順）
+        team_w = team_pitcher_weights(type_model, opponent)
+        tp = type_model['pitchers'].loc[list(team_w)].sort_values('対戦打者', ascending=False) if team_w else None
+        ALL_P = '（指定しない：相手チームの投手全体）'
+        p_options = [ALL_P] + (list(tp.index) if tp is not None else [])
+
+        def _p_label(pid):
+            if pid == ALL_P:
+                return pid
+            r = tp.loc[pid]
+            arm = {'右': '右投', '左': '左投'}.get(r['投'], '?')
+            return f"{r['選手名']}（{arm}・{'速球派' if r['速球派'] else '技巧派'}／対戦打者 {int(r['対戦打者'])}）"
+        pitcher = st.selectbox('対戦投手', p_options, format_func=_p_label, key='pitcher_select')
     with col_out:
         out = st.radio('アウトカウント', [0, 1, 2],
                        format_func=lambda x: f'{x} アウト',
@@ -607,39 +672,57 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
 
     st.divider()
 
-    # ---- 1場面の予測結果 ----
-    res = predict_one(re24, df_woba, league_avg, batter, opponent, out, runner)
-    if res['note']:
-        st.warning(res['note'])
+    # ---- 1場面の予測結果（打者タイプ × 投手タイプの相性モデル） ----
+    batter_id = find_batter_id(type_model, batter)
+    weights = team_w if pitcher == ALL_P else {pitcher: 1.0}
+    res = predict_type_one(re24, type_model, batter_id, weights, out, runner)
+    if batter_id is None:
+        st.warning(f'※ {batter} は一球速報に打席がないため、打者 wOBA はリーグ平均として計算しています。')
 
     st.subheader('📊 予測結果')
     m1, m2, m3 = st.columns(3)
-    m1.metric('基礎 RE24',      str(res['基礎RE24']       or 'N/A'))
-    m2.metric('打者 wOBA',      str(res['打者wOBA']))
+    m1.metric('基礎 RE24', str(res['基礎RE24'] or 'N/A'))
+    m2.metric('対戦 wOBA 予測', f"{res['対戦wOBA予測']:.3f}",
+              help='打者 wOBA ＋ 投手補正 ＋ 相性補正')
     delta_str = ''
-    if res['補正後期待得点'] and res['基礎RE24']:
-        delta_str = str(round(res['補正後期待得点'] - res['基礎RE24'], 3))
-    m3.metric('補正後期待得点', str(res['補正後期待得点'] or 'N/A'), delta=delta_str)
+    if res['補正後期待得点'] is not None and res['基礎RE24'] is not None:
+        delta_str = f"{res['補正後期待得点'] - res['基礎RE24']:+.3f}"
+    m3.metric('補正後期待得点', str(res['補正後期待得点'] if res['補正後期待得点'] is not None else 'N/A'),
+              delta=delta_str)
 
-    # ---- 対戦相手との対決状況 ----
+    t1, t2, t3 = st.columns(3)
+    t1.metric('打者タイプ', res['打者タイプ'] or '不明')
+    if pitcher == ALL_P:
+        t2.metric('投手タイプ', f'{opponent} の投手全体', help='登板の多さで重み付けした平均')
+    else:
+        t2.metric('投手タイプ', res['投手タイプ'] or '不明')
     avg_runs, n_team_games = get_team_avg_runs(df_team_runs, opponent)
-    d1, d2, d3 = st.columns(3)
-    d1.metric('対戦打席数', f"{res['対戦打席数']}")
-    d2.metric('対戦試合数', f"{res['対戦試合数']}")
-    d3.metric(f'{opponent} の1試合平均得点',
-             f'{avg_runs:.2f}' if avg_runs is not None else 'N/A',
-             help=f'集計試合数: {n_team_games} 試合' if n_team_games else 'データなし')
-    st.caption(f"リーグ平均 wOBA: {league_avg:.3f}")
+    t3.metric(f'{opponent} の1試合平均得点',
+              f'{avg_runs:.2f}' if avg_runs is not None else 'N/A',
+              help=f'集計試合数: {n_team_games} 試合' if n_team_games else 'データなし')
 
-    # ---- 打者 wOBA（ベイズ収縮）の内訳 ----
-    def _w(v):
-        return f'{v:.3f}' if v is not None else '—'
+    # ---- 計算の内訳 ----
     st.caption(
-        f"打者 wOBA = (PA×対戦wOBA + C×全体wOBA) / (PA + C)　"
-        f"= ({res['対戦打席数']}×{_w(res['対戦wOBA(生)'])} + {SHRINK_C}×{_w(res['全体wOBA'])}) "
-        f"/ ({res['対戦打席数']} + {SHRINK_C}) = **{res['打者wOBA']:.3f}**　"
-        f"（全体wOBAへの収縮率 {res['収縮率']:.0%}。PA は打席 − 敬遠 − 犠打）"
+        f"対戦 wOBA 予測 = 打者 wOBA {res['打者wOBA']:.3f} ＋ 投手補正 {res['投手補正']:+.3f} "
+        f"＋ 相性補正 {res['相性補正']:+.3f} = **{res['対戦wOBA予測']:.3f}**　"
+        f"（打者 wOBA は一球速報 {res['打者打席']} 打席をリーグ平均へ収縮）"
     )
+    if res['基礎RE24'] is not None and res['補正後期待得点'] is not None:
+        st.caption(
+            f"補正後期待得点 = RE24 {res['基礎RE24']:.3f} ＋ {k:.2f} × "
+            f"({res['対戦wOBA予測']:.3f} − リーグ平均 {lg:.3f}) = **{res['補正後期待得点']:.3f}**"
+        )
+    with st.expander('打者タイプ × 投手タイプの相性表'):
+        st.caption('数値はタイプ同士の対戦で、打者・投手の実力から期待される wOBA との差（×1000）。'
+                   'プラスなら打者有利。打席の少ないマスは 0 に近づけている（ベイズ収縮）。')
+        mt = (type_model['matchup'] * 1000).round(1)
+        st.dataframe(mt.style.background_gradient(cmap='RdYlGn', vmin=-30, vmax=30), width='stretch')
+        st.caption('各マスの打席数')
+        st.dataframe(type_model['matchup_n'], width='stretch')
+        pr = type_model['params']
+        st.caption(f"長打型 = ISO {pr['ISO境目']:.3f} 以上（ISO = 長打の余分な塁打 ÷ 打数）。"
+                   '速球派 = 速球の平均球速と奪三振率の z 値の平均が 0 以上。'
+                   '両打の打者は投手の逆側の打席として数える。')
 
     # ---- 対戦球団ごとの実測打率・得点期待値（状況別ではない） ----
     row = filter_team_batting_stats_by_batter(df_team_batting_stats, batter)
@@ -681,13 +764,14 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     st.divider()
 
     # ---- 全24場面 ----
-    st.subheader(f'📋 {batter} vs {opponent} — 全 24 場面')
-    df_all = predict_all(re24, df_woba, league_avg, batter, opponent)
+    vs_label = opponent if pitcher == ALL_P else f"{opponent}・{tp.loc[pitcher, '選手名']}"
+    st.subheader(f'📋 {batter} vs {vs_label} — 全 24 場面')
+    df_all = predict_type_all(re24, type_model, batter_id, weights)
     tab_chart, tab_table = st.tabs(['グラフ', 'テーブル'])
     with tab_chart:
-        st.plotly_chart(plot_24_bar(df_all, batter, opponent), width='stretch')
+        st.plotly_chart(plot_24_bar(df_all, batter, vs_label), width='stretch')
     with tab_table:
-        df_show = df_all[['アウト','ランナー','打者wOBA','対戦wOBA(生)','全体wOBA','基礎RE24','補正後期待得点','対戦打席数']]
+        df_show = df_all[['アウト','ランナー','打者wOBA','投手補正','相性補正','対戦wOBA予測','基礎RE24','補正後期待得点']]
         st.dataframe(
             df_show.style.background_gradient(
                 subset=['基礎RE24','補正後期待得点'], cmap='RdYlGn', vmin=0,
@@ -697,7 +781,7 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
         st.download_button(
             '📥 CSV ダウンロード',
             data=df_show.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'),
-            file_name=f'{batter}_vs_{opponent}_期待得点.csv',
+            file_name=f'{batter}_vs_{vs_label}_期待得点.csv',
             mime='text/csv',
         )
 
@@ -1243,27 +1327,29 @@ def main():
         st.session_state['current_page'] = page
 
         st.divider()
-        st.caption('PBP データから計算した RE24 × 打者 wOBA で場面ごとの期待得点を推定します。')
+        st.caption('一球速報から計算した RE24 に、打者・投手の実力と打者タイプ × 投手タイプの相性を足して、'
+                   '場面ごとの期待得点を推定します。')
 
     current = st.session_state['current_page']
 
     if current in ('🔮 メイン（予測）', '👥 選手成績'):
-        if not gh_cfg:
-            st.error('GitHub の認証情報が設定されていません。「⚙️ 設定」ページを確認してください。')
-            st.stop()
+        if gh_cfg:
+            src = (gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
+        else:
+            # トークン未設定 → PC 内の data/ フォルダから読む（閲覧のみ。データ更新は不可）
+            src = (None, None, None)
+            st.sidebar.info('ローカルデータで表示中（GitHub トークン未設定）')
         (re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
-         df_team_batting_stats, df_situational_stats) = load_model(
-            gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'], code_version=CODE_VERSION
-        )
-        df_pitchers = load_pitchers(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'], code_version=CODE_VERSION)
-        df_season   = load_season_batting(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'], code_version=CODE_VERSION)
+         df_team_batting_stats, df_situational_stats, type_model) = load_model(*src, code_version=CODE_VERSION)
+        df_pitchers = load_pitchers(*src, code_version=CODE_VERSION)
+        df_season   = load_season_batting(*src, code_version=CODE_VERSION)
 
         if current == '🔮 メイン（予測）':
             if n_games == 0:
                 st.info('試合データがありません。サイドバーから「⚙️ 設定」を選択して取得してください。')
                 st.stop()
             page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
-                      df_team_batting_stats, df_situational_stats, df_pitchers, df_season)
+                      df_team_batting_stats, df_situational_stats, df_pitchers, df_season, type_model)
         else:
             # 選手成績ページは、試合データ（PBP）が未取得でも打者・投手の成績を閲覧できる
             page_players(df_woba, df_career, df_team_batting_stats, df_pitchers, df_season)

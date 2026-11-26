@@ -5,3 +5,7 @@ data/players_yahoo.csv
 data/postseason_raw.json
 # validate.py の出力（python validate.py で再生成できる）
 results/
+# ローカル用の認証情報（トークンを含むので絶対にコミットしない）
+.streamlit/secrets.toml
+# エディタ設定
+.vscode/

@@ -99,7 +99,7 @@ def normalize_name(s) -> str:
 
 def normalize_team_name(raw: str | None) -> str | None:
     """カードの長い球団名を状況別データの区分名（短縮名）に変換する"""
-    if not raw:
+    if not isinstance(raw, str) or not raw:
         return None
     s = unicodedata.normalize('NFKC', raw)
     for key, target in TEAM_NAME_MAP:
@@ -785,7 +785,8 @@ def get_player_current_team(df_stats: pd.DataFrame, batter_name: str) -> str | N
 # ============================================================
 # モデル一括構築（DataFrame リストから）
 # ============================================================
-def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats_dir: str | None = None):
+def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats_dir: str | None = None,
+                         df_players: pd.DataFrame | None = None):
     """
     dfs: GitHub から読み込んだ _details.csv の DataFrame リスト
     batter_df: 対戦相手別・球場別打撃成績（all_batters_situational.csv 相当）の DataFrame
@@ -801,6 +802,10 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats
         df_team_batting_stats  = build_team_batting_stats(df_runs)
         df_situational_stats   = build_situational_stats(df_runs)
         n_pa     = len(all_df)
+        # 打者タイプ × 投手タイプの相性モデル（打者ID・投手ID の列がある新形式のデータのときだけ）
+        type_model = (build_type_model(df_runs, df_players, re24)
+                      if {'打者ID', '投手ID'}.issubset(df_runs.columns) and df_runs['投手ID'].notna().any()
+                      else None)
     else:
         re24 = pd.DataFrame(
             np.full((3, 8), np.nan),
@@ -814,9 +819,329 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats
         df_situational_stats = pd.DataFrame(
             columns=['アウト', 'ランナー状態', '打席', '打数', '安打', '打率', '得点期待値'])
         n_pa         = 0
+        type_model   = None
 
     df_woba, league_avg = build_batter_woba(batter_df)
     df_career = load_career_stats(stats_dir) if stats_dir else pd.DataFrame()
 
     return (re24, counts, df_woba, league_avg, len(dfs), n_pa, df_career, df_team_runs,
-            df_team_batting_stats, df_situational_stats)
+            df_team_batting_stats, df_situational_stats, type_model)
+
+
+# ============================================================
+# Step 8: 打者タイプ × 投手タイプの相性モデル（2026-11-26）
+#
+#   予測式（足し算の形。検証で乗法型より良かった）
+#     補正後期待得点 = RE24[アウト, 走者] + k × (w − リーグ平均wOBA)
+#     w = 打者wOBA + (投手の被wOBA − リーグ平均) + 相性[打者タイプ, 投手タイプ]
+#   k: 学習データで「打席の得点価値 ΔRE」を (打者wOBA − リーグ平均) に回帰した係数（約0.78）
+#
+#   タイプ（2 × 2 = 4 通りずつ。相性は 4 × 4 = 16 マス）
+#     打者: この打席の打席（右/左。両打は投手の逆側）× 長打型/巧打型（ISO が中央値以上なら長打型）
+#     投手: 投げ腕（右/左）× 速球派/技巧派（速球の平均球速と奪三振率 K% の z 値の平均が 0 以上なら速球派）
+#
+#   どれも一球速報（レギュラーシーズン）から計算し、打席の少ない選手・マスはベイズ収縮する
+#     打者wOBA = (分子 + C_BAT × lg) / (分母 + C_BAT)
+#     投手の被wOBA = (分子 + C_PIT × lg) / (分母 + C_PIT)
+#     相性 = Σ(実際の wOBA 分子 − 期待値) / (Σ分母 + C_MATCH)   期待値 = 打者wOBA + 投手の被wOBA − lg
+# ============================================================
+C_BAT   = 100   # 打者 wOBA をリーグ平均へ寄せる強さ（打席数）。検証で最良だった値
+C_PIT   = 100   # 投手の被 wOBA をリーグ平均へ寄せる強さ
+C_MATCH = 300   # タイプ相性を 0 へ寄せる強さ
+C_ISO   = 100   # タイプ分類用の ISO をリーグ平均へ寄せる強さ（打数）
+C_K     = 70    # タイプ分類用の K% をリーグ平均へ寄せる強さ（対戦打者数）
+MIN_PA_FOR_THRESHOLD = 100   # タイプの境目（中央値）を決めるときに使う最低打席数・対戦打者数
+
+# 一球速報の打席結果コード → wOBA の分子の重み
+WOBA_VALUE = {'BB': WOBA_W['BB'], 'HBP': WOBA_W['HBP'], '1B': WOBA_W['S'],
+              '2B': WOBA_W['D'], '3B': WOBA_W['T'], 'HR': WOBA_W['HR']}
+FASTBALLS = ('ストレート', 'ツーシーム', 'シュート')
+
+
+def add_woba_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    打席ごとの wOBA の分子・分母、ISO・K% 用の列を付ける（add_result_columns の後に使う）。
+      woba_num: 四球0.70・死球0.73・単打0.89・二塁打1.27・三塁打1.61・本塁打2.10（敬遠・凡退は 0）
+      woba_den: 1（敬遠・犠打と、結果を判定できなかった打席は 0）
+    """
+    out = df.copy()
+    known = out['結果'] != 'UNKNOWN'
+    out['woba_num'] = out['結果'].map(WOBA_VALUE).fillna(0.0).where(known, 0.0)
+    out['woba_den'] = (known & ~out['結果'].isin(['IBB', 'SAC'])).astype(int)
+    out['tb_extra'] = out['結果'].map({'2B': 1, '3B': 2, 'HR': 3}).fillna(0)   # ISO の分子（長打の余分な塁打）
+    out['is_so'] = (out['結果'] == 'SO').astype(int)
+    out['is_bf'] = known.astype(int)
+    return out
+
+
+def fastball_velocity(pitch_data) -> float | None:
+    """
+    players.csv の 球種データ（「球種:最高:平均:割合;…」）から速球の平均球速を返す。
+    ストレートがあればその平均、なければツーシーム・シュートのうち速い方。
+    （ストレートを投げない投手が「技巧派」に入ってしまうのを防ぐ）
+    """
+    if not isinstance(pitch_data, str) or not pitch_data:
+        return None
+    velo = {}
+    for item in pitch_data.split(';'):
+        parts = item.split(':')
+        if len(parts) >= 3 and parts[0] in FASTBALLS:
+            try:
+                velo[parts[0]] = float(parts[2])
+            except ValueError:
+                pass
+    if 'ストレート' in velo:
+        return velo['ストレート']
+    return max(velo.values()) if velo else None
+
+
+def _zscore(s: pd.Series, ref: pd.Series) -> pd.Series:
+    sd = ref.std()
+    return (s - ref.mean()) / sd if sd and sd > 0 else s * 0
+
+
+def build_type_model(df_runs: pd.DataFrame, df_players: pd.DataFrame | None, re24: pd.DataFrame,
+                     c_bat: float = C_BAT, c_pit: float = C_PIT, c_match: float = C_MATCH,
+                     use_style: bool = True) -> dict:
+    """
+    打席データ（calc_runs_after の出力。レギュラーシーズンのみを渡す）から相性モデルを作る。
+
+    Returns: dict
+        lg       : リーグ平均 wOBA（打席加重）
+        k        : 足し算の式の係数
+        batters  : DataFrame（index=打者ID）打席, wOBA, w（収縮後）, ISO, 長打型, 打, 選手名
+        pitchers : DataFrame（index=投手ID）対戦打者, 被wOBA, w（収縮後）, K%, 速球, 速球派, 投, 選手名, 球団
+        matchup  : DataFrame（index=打者タイプ, columns=投手タイプ）相性（wOBA の差）
+        matchup_n: 同じ形の打席数
+        params   : 収縮の強さなど
+    use_style=False にすると長打型/巧打型・速球派/技巧派を使わず、左右だけの相性になる（検証の比較用）
+    """
+    df = add_woba_columns(add_result_columns(df_runs))
+    df = attach_player_info(df, df_players)
+    df = df[df['打者ID'].notna() & df['投手ID'].notna()]
+
+    lg = float(df['woba_num'].sum() / df['woba_den'].sum())
+
+    # --- 打者 ---
+    b = df.groupby('打者ID').agg(打席=('woba_den', 'sum'), num=('woba_num', 'sum'),
+                                ab=('is_bf', 'sum'), tb_extra=('tb_extra', 'sum'),
+                                選手名=('選手名', 'first'))
+    b['wOBA'] = (b['num'] / b['打席']).where(b['打席'] > 0)
+    b['w'] = (b['num'] + c_bat * lg) / (b['打席'] + c_bat)
+    lg_iso = b['tb_extra'].sum() / b['ab'].sum()
+    b['ISO'] = (b['tb_extra'] + C_ISO * lg_iso) / (b['ab'] + C_ISO)
+    iso_cut = b.loc[b['打席'] >= MIN_PA_FOR_THRESHOLD, 'ISO'].median()
+    b['長打型'] = b['ISO'] >= iso_cut
+
+    # --- 投手 ---
+    p = df.groupby('投手ID').agg(対戦打者=('woba_den', 'sum'), num=('woba_num', 'sum'),
+                                bf=('is_bf', 'sum'), so=('is_so', 'sum'), 選手名=('投手名', 'first'))
+    p['被wOBA'] = (p['num'] / p['対戦打者']).where(p['対戦打者'] > 0)
+    p['w'] = (p['num'] + c_pit * lg) / (p['対戦打者'] + c_pit)
+    lg_k = p['so'].sum() / p['bf'].sum()
+    p['K%'] = (p['so'] + C_K * lg_k) / (p['bf'] + C_K)
+    if df_players is not None and not df_players.empty:
+        pl = df_players.copy()
+        pl['選手ID'] = pl['選手ID'].apply(normalize_player_id)
+        pl = pl.drop_duplicates('選手ID').set_index('選手ID')
+        p['速球'] = p.index.to_series().map(pl['球種データ'].apply(fastball_velocity)) if '球種データ' in pl else np.nan
+        p['速球'] = pd.to_numeric(p['速球'], errors='coerce')
+        p['投'] = p.index.to_series().map(pl['投'])
+        p['球団'] = p.index.to_series().map(pl['球団'])
+        p['選手名'] = p.index.to_series().map(pl['選手名']).fillna(p['選手名'])
+        b['打'] = b.index.to_series().map(pl['打'])
+        b['選手名'] = b.index.to_series().map(pl['選手名']).fillna(b['選手名'])
+    else:
+        p['速球'] = np.nan
+        p['投'] = None
+        p['球団'] = None
+        b['打'] = None
+    ref = p[p['bf'] >= MIN_PA_FOR_THRESHOLD]
+    zk = _zscore(p['K%'], ref['K%'])
+    zv = _zscore(p['速球'], ref['速球'])
+    p['速球派'] = pd.concat([zk, zv], axis=1).mean(axis=1, skipna=True) >= 0
+    if not use_style:   # 左右だけの相性（全員を「長打型」「速球派」に入れる）
+        b['長打型'] = True
+        p['速球派'] = True
+
+    # --- 打席ごとのタイプと期待値 ---
+    df['打者タイプ'] = batter_type_label(df['打者_打席'], df['打者ID'].map(b['長打型']))
+    df['投手タイプ'] = pitcher_type_label(df['投手_腕'], df['投手ID'].map(p['速球派']))
+    exp = df['打者ID'].map(b['w']) + df['投手ID'].map(p['w']) - lg
+    df['resid'] = df['woba_num'] - df['woba_den'] * exp
+    g = df.dropna(subset=['打者タイプ', '投手タイプ']).groupby(['打者タイプ', '投手タイプ'])
+    cell = g['resid'].sum() / (g['woba_den'].sum() + c_match)
+    matchup = cell.unstack().reindex(index=BATTER_TYPES, columns=PITCHER_TYPES).fillna(0.0)
+    matchup_n = g['woba_den'].sum().unstack().reindex(index=BATTER_TYPES, columns=PITCHER_TYPES).fillna(0).astype(int)
+
+    # --- 係数 k: 打席ごとの「wOBA の値 − lg」と ΔRE の関係（切片なし回帰）---
+    #   収縮後の打者 wOBA に回帰すると、学習データ自身への当てはまりで k が大きく出すぎる（約1.2）ため、
+    #   打席の結果そのもの（四球なら 0.70 − lg、凡退なら 0 − lg …）に回帰して「wOBA 1点 = 何点」を求める
+    k = _fit_k(df, re24, df['woba_num'] - lg * df['woba_den'])
+
+    return {'lg': lg, 'k': k, 'batters': b, 'pitchers': p, 'matchup': matchup, 'matchup_n': matchup_n,
+            'use_style': use_style,
+            'params': {'C_BAT': c_bat, 'C_PIT': c_pit, 'C_MATCH': c_match,
+                       'ISO境目': float(iso_cut), 'lg_ISO': float(lg_iso), 'lg_K%': float(lg_k)}}
+
+
+BATTER_TYPES  = ['右打・長打型', '右打・巧打型', '左打・長打型', '左打・巧打型']
+PITCHER_TYPES = ['右投・速球派', '右投・技巧派', '左投・速球派', '左投・技巧派']
+
+
+def batter_type_label(stance, power) -> pd.Series:
+    """打席（右/左）と長打型フラグから '右打・長打型' のようなラベルを作る（どちらか不明なら None）"""
+    s, pw = pd.Series(stance).reset_index(drop=True), pd.Series(power).reset_index(drop=True)
+    lab = s.map({'右': '右打', '左': '左打'}) + '・' + pw.map({True: '長打型', False: '巧打型'})
+    lab.index = pd.Series(stance).index
+    return lab
+
+
+def pitcher_type_label(arm, fast) -> pd.Series:
+    """投げ腕（右/左）と速球派フラグから '右投・速球派' のようなラベルを作る（どちらか不明なら None）"""
+    a, f = pd.Series(arm).reset_index(drop=True), pd.Series(fast).reset_index(drop=True)
+    lab = a.map({'右': '右投', '左': '左投'}) + '・' + f.map({True: '速球派', False: '技巧派'})
+    lab.index = pd.Series(arm).index
+    return lab
+
+
+def _fit_k(df: pd.DataFrame, re24: pd.DataFrame, x: pd.Series) -> float:
+    """ΔRE = RE(次の打席) − RE(この打席) + この打席の得点 を x に回帰した係数（切片なし）"""
+    d = df.copy()
+    d['x'] = x
+    d['runner_idx'] = d['ランナー'].fillna('').map(RUNNER_MAP).fillna(0).astype(int)
+    arr = re24.values
+    d['RE'] = [arr[o, r] if 0 <= o <= 2 else np.nan for o, r in zip(d['アウト'].astype(int), d['runner_idx'])]
+    grp = d.groupby(['game_id', 'イニング'], sort=False)
+    nxt_re, nxt_runs = grp['RE'].shift(-1), grp['runs_after'].shift(-1)
+    d['dRE'] = nxt_re.fillna(0) - d['RE'] + (d['runs_after'] - nxt_runs.fillna(0))
+    d = d.dropna(subset=['dRE', 'x'])
+    den = float((d['x'] ** 2).sum())
+    return float((d['x'] * d['dRE']).sum() / den) if den > 0 else 0.0
+
+
+def type_features(df: pd.DataFrame, model: dict, df_players: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    打席データ（打者ID・投手ID つき）の各打席に、相性モデルの要素を列で付ける。
+      tm_打者  : 打者 wOBA（収縮後。学習に出ない打者は lg）
+      tm_投手  : 投手補正 = 投手の被 wOBA（収縮後）− lg（学習に出ない投手は 0）
+      tm_相性  : 相性[打者タイプ, 投手タイプ]（タイプが分からなければ 0）
+      tm_打者タイプ, tm_投手タイプ
+    """
+    lg, b, p, mt = model['lg'], model['batters'], model['pitchers'], model['matchup']
+    d = attach_player_info(df, df_players)
+    out = pd.DataFrame(index=df.index)
+    out['tm_打者'] = d['打者ID'].map(b['w']).fillna(lg)
+    out['tm_投手'] = (d['投手ID'].map(p['w']) - lg).fillna(0.0)
+    bt = batter_type_label(d['打者_打席'], d['打者ID'].map(b['長打型']))
+    pt = pitcher_type_label(d['投手_腕'], d['投手ID'].map(p['速球派']))
+    stacked = mt.stack()
+    out['tm_相性'] = [float(stacked.get((x, y), 0.0)) if isinstance(x, str) and isinstance(y, str) else 0.0
+                      for x, y in zip(bt, pt)]
+    out['tm_打者タイプ'], out['tm_投手タイプ'] = bt, pt
+    return out
+
+
+def type_matchup_ability(model: dict, batter_id, pitcher_weights: dict | None = None) -> dict:
+    """
+    打者の能力 w を、対戦投手（または投手の集まり）に合わせて計算する。
+      pitcher_weights: {投手ID: 重み}。1人なら {ID: 1}。None なら投手を考えない（打者だけ）
+    返り値: w, 打者wOBA, 投手補正, 相性補正, 打者タイプ（右/左投手それぞれ）, 内訳など
+    """
+    lg = model['lg']
+    b, p, mt = model['batters'], model['pitchers'], model['matchup']
+    bid = normalize_player_id(batter_id)
+    if bid in b.index:
+        brow = b.loc[bid]
+        w_b, pa = float(brow['w']), int(brow['打席'])
+        power, bats = bool(brow['長打型']), brow.get('打')
+    else:
+        w_b, pa, power, bats = lg, 0, None, None
+
+    res = {'打者wOBA': w_b, '打者打席': pa, '投手補正': 0.0, '相性補正': 0.0,
+           '打者タイプ': None, '投手タイプ': None, '投手': []}
+    if not pitcher_weights:
+        res['w'] = w_b
+        res['打者タイプ'] = _type_for(bats, power, None)
+        return res
+
+    tot = sum(pitcher_weights.values())
+    p_eff = m_eff = 0.0
+    for pid, wt in pitcher_weights.items():
+        pid = normalize_player_id(pid)
+        wt = wt / tot if tot else 0
+        prow = p.loc[pid] if pid in p.index else None
+        pe = float(prow['w']) - lg if prow is not None else 0.0
+        arm = prow['投'] if prow is not None else None
+        fast = bool(prow['速球派']) if prow is not None else None
+        bt = _type_for(bats, power, arm)
+        pt = (pitcher_type_label(pd.Series([arm]), pd.Series([fast])).iloc[0]
+              if arm in ('右', '左') and fast is not None else None)
+        me = float(mt.loc[bt, pt]) if bt in mt.index and pt in mt.columns else 0.0
+        p_eff += wt * pe
+        m_eff += wt * me
+        res['投手'].append({'投手ID': pid, '重み': wt, '投手補正': pe, '相性補正': me,
+                            '打者タイプ': bt, '投手タイプ': pt})
+    res['投手補正'], res['相性補正'] = p_eff, m_eff
+    res['w'] = w_b + p_eff + m_eff
+    if len(res['投手']) == 1:
+        res['打者タイプ'], res['投手タイプ'] = res['投手'][0]['打者タイプ'], res['投手'][0]['投手タイプ']
+    else:
+        types = {x['打者タイプ'] for x in res['投手'] if x['打者タイプ']}
+        if len(types) == 1:
+            res['打者タイプ'] = types.pop()
+        elif bats == '両' and power is not None:
+            res['打者タイプ'] = '両打・' + ('長打型' if power else '巧打型')
+    return res
+
+
+def _type_for(bats, power, pitcher_arm) -> str | None:
+    """打者の打席（両打は投手の逆側）と長打型フラグからタイプ名"""
+    if power is None or bats not in ('右', '左', '両'):
+        return None
+    stance = {'右': '左', '左': '右'}.get(pitcher_arm) if bats == '両' else bats
+    if stance is None:
+        stance = '左' if bats == '両' else bats   # 両打で投手不明なら、多い右投手を想定して左打席
+    return batter_type_label(pd.Series([stance]), pd.Series([power])).iloc[0]
+
+
+def team_pitcher_weights(model: dict, team: str) -> dict:
+    """相手チームの投手を、学習データの対戦打者数で重み付けした {投手ID: 重み}（team は短縮名）"""
+    p = model['pitchers']
+    if '球団' not in p:
+        return {}
+    teams = p['球団'].apply(normalize_team_name)
+    sub = p[teams == team]
+    return {pid: float(n) for pid, n in sub['対戦打者'].items() if n > 0}
+
+
+def predict_type_one(re24: pd.DataFrame, model: dict, batter_id, pitcher_weights: dict | None,
+                     out: int, runner: str) -> dict:
+    """1場面の予測（足し算の形）。補正後期待得点 = RE24 + k × (w − lg)"""
+    base_re = re24.iloc[out, RUNNER_MAP.get(runner, 0)]
+    a = type_matchup_ability(model, batter_id, pitcher_weights)
+    adj = base_re + model['k'] * (a['w'] - model['lg']) if not np.isnan(base_re) else np.nan
+    return {'アウト': out, 'ランナー': runner if runner else '走者なし',
+            '打者wOBA': round(a['打者wOBA'], 3), '投手補正': round(a['投手補正'], 3),
+            '相性補正': round(a['相性補正'], 3), '対戦wOBA予測': round(a['w'], 3),
+            '基礎RE24': round(float(base_re), 3) if not np.isnan(base_re) else None,
+            '補正後期待得点': round(float(adj), 3) if not np.isnan(adj) else None,
+            '打者タイプ': a['打者タイプ'], '投手タイプ': a['投手タイプ'], '打者打席': a['打者打席']}
+
+
+def find_batter_id(model: dict | None, batter_name: str) -> str | None:
+    """
+    打者名（nf3 の表記）から相性モデルの打者IDを探す。同名の別人（オスナ、マルティネスなど）が
+    いる場合は、打席の多い方（＝打者として出ている方）を選ぶ。
+    """
+    if model is None:
+        return None
+    b = model['batters']
+    key = normalize_name(batter_name)
+    hit = b[b['選手名'].apply(normalize_name) == key]
+    return hit['打席'].idxmax() if not hit.empty else None
+
+
+def predict_type_all(re24, model, batter_id, pitcher_weights) -> pd.DataFrame:
+    return pd.DataFrame([predict_type_one(re24, model, batter_id, pitcher_weights, o, r)
+                         for o in range(3) for r in RUNNER_LABEL])

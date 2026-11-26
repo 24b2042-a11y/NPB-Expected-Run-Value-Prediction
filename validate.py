@@ -256,6 +256,14 @@ def evaluate(y: pd.Series, preds: pd.DataFrame, games: pd.Series, n_boot: int, s
                      '差_95%下限': float(np.percentile(diff_b, 2.5)),
                      '差_95%上限': float(np.percentile(diff_b, 97.5)),
                      '改善する割合': float((diff_b < 0).mean())})
+        # 相性の上乗せ効果を見るため「打者+投手」との対応のある差も出す
+        base2 = '加法:型:打者+投手'
+        if base2 in preds.columns:
+            b2 = np.sqrt(g_sum[base2].to_numpy()[boot_idx].sum(1) / g_n.to_numpy()[boot_idx].sum(1))
+            d2 = rmse_b - b2
+            rows[-1].update({'差_vs打者+投手': rmse - float(np.sqrt(((preds[base2] - y) ** 2).mean())),
+                             '差2_95%下限': float(np.percentile(d2, 2.5)),
+                             '差2_95%上限': float(np.percentile(d2, 97.5))})
     return pd.DataFrame(rows).sort_values('RMSE').reset_index(drop=True)
 
 
@@ -315,6 +323,30 @@ def run(split: str = 'postseason', test_frac: float = 0.2, woba_source: str = 'p
     df_train = attach_ability(df_train, pair, single, lg)
     df_test  = attach_ability(df_test, pair, single, lg)
     k = fit_k(df_train, lg)
+
+    # --- 打者タイプ × 投手タイプの相性モデル（core.build_type_model、学習データだけで作る）---
+    if os.path.exists(players_path):
+        pl_all = pd.read_csv(players_path, encoding='utf-8-sig', dtype={'選手ID': str, '背番号': str})
+        variants = {
+            '': dict(),                                  # 既定: C_PIT=100, C_MATCH=300
+            '[左右のみ]': dict(use_style=False),
+            '[C_PIT300]': dict(c_pit=300),
+            '[C_MATCH100]': dict(c_match=100),
+            '[C_MATCH1000]': dict(c_match=1000),
+        }
+        for tag, kw in variants.items():
+            tm = core.build_type_model(df_train, pl_all, re24, **kw)
+            for d in (df_train, df_test):
+                f = core.type_features(d, tm, pl_all)
+                if tag == '':
+                    d['w_型:打者'] = f['tm_打者']
+                    d['w_型:打者+投手'] = f['tm_打者'] + f['tm_投手']
+                    d['w_型:打者+相性'] = f['tm_打者'] + f['tm_相性']
+                    d['w_型:打者+投手+相性'] = f['tm_打者'] + f['tm_投手'] + f['tm_相性']
+                elif tag == '[左右のみ]':
+                    d['w_型:打者+投手+左右'] = f['tm_打者'] + f['tm_投手'] + f['tm_相性']
+                else:
+                    d[f'w_型:打者+投手+相性{tag}'] = f['tm_打者'] + f['tm_投手'] + f['tm_相性']
 
     known = set(df_woba['選手名_key'])
     match_rate = float(df_test['batter_key'].isin(known).mean())
