@@ -400,7 +400,8 @@ def render_batter_stats(batter, df_woba, df_career, df_team_batting_stats, df_se
         tab_recent, tab_real, tab_career = tabs
 
     with tab_recent:
-        df_b = (df_woba[df_woba['選手名'] == batter][['区分名','打席','wOBA']]
+        # メインページの打者名は一球速報の表記（姓と名の間に空白）なので、正規化した名前で照合する
+        df_b = (df_woba[df_woba['選手名_key'] == normalize_name(batter)][['区分名','打席','wOBA']]
                 .query('打席 >= 10').sort_values('wOBA', ascending=False))
         df_b['wOBA'] = df_b['wOBA'].round(3)
         df_b.columns = ['対戦相手','打席数','wOBA']
