@@ -18,8 +18,10 @@ https://baseball.yahoo.co.jp/npb/player/{ID}/top から以下を取得する。
 保存先: data/players.csv（github_sync.save_players_csv_to_github）
 
 ローカル実行:
-    python player_scraper.py            … data/gamedata に出てくる選手のうち未取得分
-    python player_scraper.py --all      … 全員を取り直す（シーズン途中の球速更新用）
+    python player_scraper.py               … data/gamedata に出てくる選手のうち未取得分
+    python player_scraper.py --from-teams  … 12球団の投手成績・打撃成績ページに載っている
+                                             （今季1軍に出場した）選手のうち未取得分
+    python player_scraper.py --all         … 全員を取り直す（シーズン途中の球速更新用）
 """
 import re
 import time
@@ -35,7 +37,12 @@ RE_KANA    = re.compile(r'[（(].*?[）)]')
 
 PLAYER_COLS = ['選手ID', '選手名', '選手名_key', '球団', '背番号', 'ポジション',
                '投打', '投', '打',
-               '直球_平均球速', '直球_最高球速', '直球_割合', '球種数', '全球種_平均球速']
+               '直球_平均球速', '直球_最高球速', '直球_割合', '球種数', '全球種_平均球速',
+               '球種データ']
+# 球種データ: 「球種:最高球速:平均球速:投球割合(%)」を ; で連結した生データ（後から別の指標を作れるように残す）
+
+# スポナビの球団ID（/npb/teams/{ID}/...）。楽天だけ 376
+TEAM_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 376]
 
 
 def _to_float(s) -> float | None:
@@ -48,7 +55,7 @@ def _to_float(s) -> float | None:
 def _parse_pitch_table(soup: BeautifulSoup) -> dict:
     """「投球データ」表（球種・球速・投球割合）から球速の指標を作る"""
     out = {'直球_平均球速': None, '直球_最高球速': None, '直球_割合': None,
-           '球種数': None, '全球種_平均球速': None}
+           '球種数': None, '全球種_平均球速': None, '球種データ': None}
     table = soup.find('table', class_='bb-pitchingRateTable')
     if table is None or table.tbody is None:
         return out
@@ -69,6 +76,9 @@ def _parse_pitch_table(soup: BeautifulSoup) -> dict:
 
     df = pd.DataFrame(rows)
     out['球種数'] = int(len(df))
+    out['球種データ'] = ';'.join(
+        f"{r['球種']}:{'' if r['最高'] is None else r['最高']}:{'' if r['平均'] is None else r['平均']}:{'' if r['割合'] is None else r['割合']}"
+        for r in rows)
     st = df[df['球種'] == 'ストレート']
     if not st.empty:
         out['直球_平均球速'] = st['平均'].iloc[0]
@@ -164,6 +174,24 @@ def collect_player_ids(details_dfs: list[pd.DataFrame]) -> list[str]:
     return list(dict.fromkeys(ids))
 
 
+def collect_ids_from_teams(sleep_sec: float = 1.5) -> list[str]:
+    """
+    12球団の「投手成績」「打撃成績」ページ（/npb/teams/{ID}/pitchingstats, battingstats）
+    に載っている選手の ID を返す。今季1軍に出場した選手が対象。
+    試合データ（_details.csv）の再取得を待たずに選手マスタを作るときに使う。
+    """
+    ids = []
+    for tid in TEAM_IDS:
+        for kind in ('pitchingstats', 'battingstats'):
+            url = f'https://baseball.yahoo.co.jp/npb/teams/{tid}/{kind}'
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            if resp.status_code == 200:
+                resp.encoding = 'utf-8'
+                ids.extend(re.findall(r'/npb/player/(\d+)/', resp.text))
+            time.sleep(sleep_sec)
+    return list(dict.fromkeys(ids))
+
+
 def merge_players(df_old: pd.DataFrame | None, df_new: pd.DataFrame) -> pd.DataFrame:
     """既存マスタに新規取得分を上書きマージする（選手IDで一意）"""
     if df_old is None or df_old.empty:
@@ -181,18 +209,26 @@ if __name__ == '__main__':
 
     ap = argparse.ArgumentParser(description='スポナビ選手ページから data/players.csv を作る')
     ap.add_argument('--all', action='store_true', help='取得済みの選手も取り直す')
+    ap.add_argument('--from-teams', action='store_true',
+                    help='試合データではなく12球団の成績ページから選手IDを集める')
     ap.add_argument('--sleep', type=float, default=1.5, help='リクエスト間隔（秒）')
     args = ap.parse_args()
 
     base     = os.path.dirname(os.path.abspath(__file__))
     out_path = os.path.join(base, 'data', 'players.csv')
-    dfs = [pd.read_csv(p, encoding='utf-8-sig')
-           for p in glob.glob(os.path.join(base, 'data', 'gamedata', '*_details.csv'))]
-    ids = collect_player_ids(dfs)
+    if args.from_teams:
+        ids = collect_ids_from_teams(args.sleep)
+    else:
+        dfs = [pd.read_csv(p, encoding='utf-8-sig')
+               for p in glob.glob(os.path.join(base, 'data', 'gamedata', '*_details.csv'))]
+        ids = collect_player_ids(dfs)
     if not ids:
-        raise SystemExit('打者ID・投手ID のある _details.csv がありません。先に python scraper.py --refetch を実行してください。')
+        raise SystemExit('打者ID・投手ID のある _details.csv がありません。'
+                         '先に python scraper.py --refetch を実行するか、--from-teams を付けてください。')
 
-    df_old = pd.read_csv(out_path, encoding='utf-8-sig', dtype={'選手ID': str}) if os.path.exists(out_path) else None
+    # 選手ID・背番号は文字列で読む（数値で読むと育成選手の背番号「011」が「11」になる）
+    df_old = (pd.read_csv(out_path, encoding='utf-8-sig', dtype={'選手ID': str, '背番号': str})
+              if os.path.exists(out_path) else None)
     if df_old is not None and not args.all:
         ids = [i for i in ids if i not in set(df_old['選手ID'].astype(str))]
     print(f'取得対象: {len(ids)} 人（約 {len(ids) * args.sleep / 60:.0f} 分）')

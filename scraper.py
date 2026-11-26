@@ -306,12 +306,33 @@ def scrape_games(
 # ローカル実行: 既存の data/gamedata を新形式で取り直す
 #   python scraper.py --refetch            … 投手ID列のないファイルだけ再取得
 #   python scraper.py --refetch --all      … 全ファイルを再取得
+#   python scraper.py --ids 2021039474-2021039495   … 指定した試合IDを取得（ポストシーズンなど）
+#     存在しないID（未開催の試合）は自動でスキップされる
 # 取得後は git で data/gamedata をコミットする（Streamlit から1ファイルずつ
 # コミットすると 1,600 回以上の API 呼び出しになるため、一括再取得はローカル推奨）。
 # ============================================================
-def _refetch_local(data_dir: str, refetch_all: bool, sleep_sec: float) -> None:
+def _parse_ids(spec: str) -> list[int]:
+    """'2021039474-2021039495,2021039499' のような指定を ID のリストにする"""
+    ids = []
+    for part in spec.split(','):
+        part = part.strip()
+        if '-' in part:
+            a, b = part.split('-', 1)
+            ids.extend(range(int(a), int(b) + 1))
+        elif part:
+            ids.append(int(part))
+    return ids
+
+
+def _refetch_local(data_dir: str, refetch_all: bool, sleep_sec: float,
+                   ids: list[int] | None = None) -> None:
     import glob
     import os
+
+    if ids is not None:
+        targets = ids
+        print(f'指定された {len(targets)} 個のIDを取得します')
+        return _fetch_and_save(data_dir, targets, sleep_sec)
 
     targets = []
     for path in sorted(glob.glob(os.path.join(data_dir, '*_details.csv'))):
@@ -327,6 +348,12 @@ def _refetch_local(data_dir: str, refetch_all: bool, sleep_sec: float) -> None:
             targets.append(gid)
 
     print(f'再取得対象: {len(targets)} 試合（間隔 {sleep_sec} 秒 → 約 {len(targets) * sleep_sec / 60:.0f} 分）')
+    _fetch_and_save(data_dir, targets, sleep_sec)
+
+
+def _fetch_and_save(data_dir: str, targets: list[int], sleep_sec: float) -> None:
+    import os
+
     n_ok = n_ng = 0
     for i, r in enumerate(scrape_games(0, 0, sleep_sec=sleep_sec, game_ids=targets), 1):
         gid, card = r['game_id'], r['card']
@@ -350,11 +377,14 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='スポナビ一球速報の取得')
     ap.add_argument('--refetch', action='store_true', help='data/gamedata の既存試合を新形式で再取得')
     ap.add_argument('--all', action='store_true', help='投手ID列があるファイルも含めて全て再取得')
+    ap.add_argument('--ids', type=str, default=None,
+                    help='取得する試合ID（例: 2021039474-2021039495,2021039499）')
     ap.add_argument('--sleep', type=float, default=2.0, help='リクエスト間隔（秒）')
     args = ap.parse_args()
 
-    if not args.refetch:
+    if not (args.refetch or args.ids):
         ap.print_help()
         sys.exit(0)
     base = os.path.dirname(os.path.abspath(__file__))
-    _refetch_local(os.path.join(base, 'data', 'gamedata'), args.all, args.sleep)
+    _refetch_local(os.path.join(base, 'data', 'gamedata'), args.all, args.sleep,
+                   ids=_parse_ids(args.ids) if args.ids else None)

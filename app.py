@@ -57,7 +57,7 @@ from github_sync import (
     load_players_csv_from_github,
     get_legacy_game_ids,
 )
-from batter_scraper import scrape_all_batters
+from batter_scraper import scrape_all_batters, TEAMS as BATTER_TEAMS
 from pitcher_scraper import scrape_all_pitchers
 from player_scraper import scrape_players, collect_player_ids, merge_players
 
@@ -320,13 +320,13 @@ def render_pitcher_stats(df_pitchers, opponent: str | None = None, key_prefix: s
         if d.empty:
             st.caption('対戦相手別のデータがありません（個別ページを取得できていない可能性があります）。')
         else:
-            st.dataframe(d, use_container_width=True)
+            st.dataframe(d, width='stretch')
     with tab_std:
         d = split_table('球場')
         if d.empty:
             st.caption('球場別のデータがありません（個別ページを取得できていない可能性があります）。')
         else:
-            st.dataframe(d, use_container_width=True)
+            st.dataframe(d, width='stretch')
     st.caption('※ 対戦相手別・球場別の K%・BB% は、被打者を「3×投球回＋被安＋四球＋死球」で'
                '推定した概算です。投球回が少ないと数値が大きくぶれます。')
 
@@ -354,7 +354,7 @@ def render_batter_stats(batter, df_woba, df_career, df_team_batting_stats, df_se
         if df_b.empty:
             st.caption('対戦相手別データ（打席10以上）がありません。')
         else:
-            st.dataframe(df_b, use_container_width=True)
+            st.dataframe(df_b, width='stretch')
 
     with tab_real:
         df_r = (filter_team_batting_stats_by_batter(df_team_batting_stats, batter)
@@ -363,7 +363,7 @@ def render_batter_stats(batter, df_woba, df_career, df_team_batting_stats, df_se
         if df_r.empty:
             st.caption('実測データ（プレーバイプレー）がありません。')
         else:
-            st.dataframe(df_r, use_container_width=True)
+            st.dataframe(df_r, width='stretch')
             st.caption('打率・得点期待値は標本数が少ない（打席5未満）場合 N/A になります。')
 
     with tab_career:
@@ -373,9 +373,9 @@ def render_batter_stats(batter, df_woba, df_career, df_team_batting_stats, df_se
         else:
             df_show = career[['年度','所属球団','試合','打席','打率','出塁率','長打率','OPS',
                               '本塁打','打点','盗塁']].reset_index(drop=True)
-            st.dataframe(df_show, use_container_width=True)
+            st.dataframe(df_show, width='stretch')
             if len(career) >= 2:
-                st.plotly_chart(plot_career_trend(career), use_container_width=True)
+                st.plotly_chart(plot_career_trend(career), width='stretch')
 
 
 # ============================================================
@@ -421,7 +421,7 @@ def render_season_batting(batter, df_season):
     for c in ('打率', '出塁率', '長打率', 'OPS', 'wOBA'):
         if c in d.columns:
             d[c] = d[c].round(3)
-    st.dataframe(d.reset_index(drop=True), use_container_width=True)
+    st.dataframe(d.reset_index(drop=True), width='stretch')
     note = f'{CURRENT_SEASON}年の対戦相手別成績（nf3）を合計した通算です。'
     if len(mine) > 1:
         note += '移籍した選手は球団ごとに行が分かれ、上の指標は打席数の多い球団のものです。'
@@ -456,7 +456,7 @@ def render_season_leaderboard(df_season, df_pitchers):
                 for c in ('打率', '出塁率', '長打率', 'OPS', 'wOBA'):
                     if c in show.columns:
                         show[c] = show[c].round(3)
-                st.dataframe(show.reset_index(drop=True), use_container_width=True, height=600)
+                st.dataframe(show.reset_index(drop=True), width='stretch', height=600)
                 st.download_button(
                     '📥 CSV ダウンロード',
                     data=show.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'),
@@ -496,7 +496,7 @@ def render_season_leaderboard(df_season, df_pitchers):
                 for c in ('防御率', 'WHIP', 'FIP'):
                     if c in show.columns:
                         show[c] = show[c].round(2)
-                st.dataframe(show.reset_index(drop=True), use_container_width=True, height=600)
+                st.dataframe(show.reset_index(drop=True), width='stretch', height=600)
                 st.download_button(
                     '📥 CSV ダウンロード',
                     data=show.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'),
@@ -661,11 +661,11 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     # ---- RE24 ヒートマップ ----
     st.subheader('🗺 RE24 行列')
     hl_runner = runner if runner != '走者なし' else ''
-    st.plotly_chart(plot_re24_heatmap(re24, out, hl_runner), use_container_width=True)
+    st.plotly_chart(plot_re24_heatmap(re24, out, hl_runner), width='stretch')
     with st.expander('各マスのサンプル数'):
         st.dataframe(
             pd.DataFrame(counts, index=['0アウト','1アウト','2アウト'], columns=RUNNER_LABEL),
-            use_container_width=True,
+            width='stretch',
         )
 
     # ---- 状況別の実測打率・得点期待値（球団を問わず全体） ----
@@ -675,7 +675,7 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
         df_situational_stats.style.background_gradient(
             subset=['打率', '得点期待値'], cmap='RdYlGn',
         ),
-        use_container_width=True, height=320,
+        width='stretch', height=320,
     )
 
     st.divider()
@@ -685,14 +685,14 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     df_all = predict_all(re24, df_woba, league_avg, batter, opponent)
     tab_chart, tab_table = st.tabs(['グラフ', 'テーブル'])
     with tab_chart:
-        st.plotly_chart(plot_24_bar(df_all, batter, opponent), use_container_width=True)
+        st.plotly_chart(plot_24_bar(df_all, batter, opponent), width='stretch')
     with tab_table:
         df_show = df_all[['アウト','ランナー','打者wOBA','対戦wOBA(生)','全体wOBA','基礎RE24','補正後期待得点','対戦打席数']]
         st.dataframe(
             df_show.style.background_gradient(
                 subset=['基礎RE24','補正後期待得点'], cmap='RdYlGn', vmin=0,
             ),
-            use_container_width=True, height=600,
+            width='stretch', height=600,
         )
         st.download_button(
             '📥 CSV ダウンロード',
@@ -730,6 +730,17 @@ def _check_batter_df(df_new: pd.DataFrame, df_old: pd.DataFrame | None) -> list[
     missing = [c for c in BATTER_REQUIRED_COLS if c not in df_new.columns]
     if missing:
         return [f'必要な列がありません: {", ".join(missing)}（サイト構造の変更、または表の取りこぼしの可能性）']
+
+    # 球団の欠け: 2026-11-19 に一部球団の取得失敗が黙って保存され、12球団→4球団になったことへの対策
+    for msg in df_new.attrs.get('failed_teams', []):
+        problems.append(f'取得できなかった球団があります: {msg}（このまま保存すると、その球団の打者が消えます）')
+    expected = {t[0] for t in BATTER_TEAMS}
+    got = set(df_new['球団'].dropna().unique())
+    if got != expected:
+        problems.append(f'球団がそろっていません（{len(got)}/{len(expected)}）。欠け: {", ".join(sorted(expected - got))}')
+    n_fp = len(df_new.attrs.get('failed_players', []))
+    if n_fp:
+        problems.append(f'詳細ページを取得できなかった選手が {n_fp} 人います')
 
     # 四球・死球・敬遠・犠打は2つ目の表にある列。取りこぼすと wOBA が低く出る
     for c in ('四球', '死球', '敬遠', '犠打'):
@@ -1130,11 +1141,11 @@ def page_settings(gh_cfg):
     st.divider()
     st.subheader('📁 データソース')
     st.markdown(
-        f'- 打席イベント: GitHub `data/gamedata/*_details.csv`\n'
-        f'- 状況別打者成績: `data/all_batters_situational.csv`\n'
-        f'- 投手成績: `data/all_pitchers.csv`\n'
-        f'- 選手マスタ（投打・球速）: `data/players.csv`\n'
-        f'- 過去3年成績: `data/2023~2025打撃データ/stats_YYYY.csv`'
+        '- 打席イベント: GitHub `data/gamedata/*_details.csv`（RE24 はレギュラーシーズンのみ。オールスター・ポストシーズンは除く）\n'
+        '- 状況別打者成績: `data/all_batters_situational.csv`\n'
+        '- 投手成績: `data/all_pitchers.csv`\n'
+        '- 選手マスタ（投打・球速）: `data/players.csv`\n'
+        '- 過去3年成績: `data/2023~2025打撃データ/stats_YYYY.csv`'
     )
 
     st.divider()

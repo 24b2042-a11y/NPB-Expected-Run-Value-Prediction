@@ -18,6 +18,13 @@ from github import Github, GithubException
 BATTER_CSV_PATH  = 'data/all_batters_situational.csv'
 PITCHER_CSV_PATH = 'data/all_pitchers.csv'
 PLAYERS_CSV_PATH = 'data/players.csv'
+PLAYERS_STR_COLS = {'選手ID': str, '背番号': str}
+
+# オールスター（試合IDがポストシーズンより大きい）。新規取得の開始IDを決めるときに除く
+ALLSTAR_IDS = {2021039499, 2021039500}
+# この数以上あとの試合IDが取得済みなら、「試合終了」がなくても終わった試合とみなす
+# （雨天コールドなどで「試合終了」が書かれない試合が毎回取り直されていたため）
+DONE_IF_LATER_GAMES = 12
 
 
 def get_repo(token: str, repo_name: str):
@@ -90,6 +97,7 @@ def load_csv_from_github(
     repo_name: str,
     path: str,
     branch: str = 'main',
+    dtype: dict | None = None,
 ) -> pd.DataFrame | None:
     repo = get_repo(token, repo_name)
     try:
@@ -120,7 +128,7 @@ def load_csv_from_github(
     except Exception:
         return None
 
-    return pd.read_csv(io.BytesIO(raw), encoding='utf-8-sig')
+    return pd.read_csv(io.BytesIO(raw), encoding='utf-8-sig', dtype=dtype)
 
 
 # ============================================================
@@ -189,7 +197,8 @@ def load_players_csv_from_github(
     branch: str = 'main',
     path: str = PLAYERS_CSV_PATH,
 ) -> pd.DataFrame | None:
-    return load_csv_from_github(token, repo_name, path, branch)
+    # 選手ID・背番号は文字列で読む（数値で読むと育成選手の背番号「011」が「11」になる）
+    return load_csv_from_github(token, repo_name, path, branch, dtype=PLAYERS_STR_COLS)
 
 
 # ============================================================
@@ -322,6 +331,7 @@ def get_existing_game_ids(
     latest_id      = None
 
     files = _fetch_details_archive(token, repo_name, branch)
+    all_ids = sorted(int(f.split('_', 1)[0]) for f, _ in files if f.split('_', 1)[0].isdigit())
 
     for fname, df in files:
         try:
@@ -329,12 +339,14 @@ def get_existing_game_ids(
         except Exception:
             continue
 
-        if _is_complete(df):
+        n_later = len(all_ids) - 1 - all_ids.index(game_id)
+        if _is_complete(df) or (df is not None and len(df) >= 30 and n_later >= DONE_IF_LATER_GAMES):
             complete_ids.add(game_id)
         else:
             incomplete_ids.add(game_id)
 
-        if latest_id is None or game_id > latest_id:
+        # オールスターは試合IDがポストシーズンより大きいので、開始IDの計算から除く
+        if game_id not in ALLSTAR_IDS and (latest_id is None or game_id > latest_id):
             latest_id = game_id
 
     return complete_ids, incomplete_ids, latest_id
@@ -366,8 +378,8 @@ def _is_complete(df: pd.DataFrame) -> bool:
     _details.csv が完全な試合データかを判定する。
     完全の条件:
       - 打席数が 10 以上
-      - 本文に「試合終了」を含む行がある
+      - 本文に「試合終了」「コールド」「ノーゲーム」のどれかを含む行がある
     """
     if df is None or len(df) < 10:
         return False
-    return df['本文'].fillna('').str.contains('試合終了').any()
+    return df['本文'].fillna('').str.contains('試合終了|コールド|ノーゲーム').any()

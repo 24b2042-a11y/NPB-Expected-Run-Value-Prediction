@@ -16,6 +16,36 @@ WOBA_W       = dict(BB=0.70, HBP=0.73, S=0.89, D=1.27, T=1.61, HR=2.10)
 RE_SCORE     = re.compile(r'\S+\s+(\d+)-(\d+)\s+\S+')
 # scraper.py が _details.csv に追加した列（2026-11〜）。calc_runs_after で引き継ぐ
 DETAIL_EXTRA_COLS = ['打者ID', '投手名', '投手ID', '攻撃']
+
+# レギュラーシーズン以外の試合（スポナビの試合ID）。RE24 などはレギュラーシーズンだけで計算する
+# （検証の設計: レギュラーシーズンで学習 → ポストシーズンでテスト。研究計画ドキュメント参照）
+ALLSTAR_IDS = {2021039499, 2021039500}
+POSTSEASON_IDS = {
+    2021039474, 2021039475,                          # CS 1st セ（巨人 vs DeNA）
+    2021039477, 2021039478, 2021039479,              # CS 1st パ（西武 vs 日本ハム）
+    2021039480, 2021039481, 2021039482, 2021039483,  # CS ファイナル セ（阪神 vs DeNA）
+    2021039486, 2021039487, 2021039488,              # CS ファイナル パ（ソフトバンク vs 日本ハム）
+    2021039492, 2021039493, 2021039494, 2021039495,  # 日本シリーズ（DeNA vs ソフトバンク）
+}
+NON_REGULAR_IDS = ALLSTAR_IDS | POSTSEASON_IDS
+
+
+def is_regular_season(game_id) -> bool:
+    """レギュラーシーズンの試合か（オールスター・ポストシーズンでない）"""
+    try:
+        return int(game_id) not in NON_REGULAR_IDS
+    except (TypeError, ValueError):
+        return True
+
+
+def find_last_score(body) -> re.Match | None:
+    """
+    本文の中の「最後の」得点表記（例: 広 3-5 ロ）を返す。
+    1打席の本文に得点が2回書かれることがある（例: 「暴投 広 3-4 ロ … タイムリー 広 3-5 ロ」）。
+    以前は最初の表記だけを読んでいたため、7試合でスコアボードと得点が合わなかった。
+    """
+    ms = list(RE_SCORE.finditer(str(body)))
+    return ms[-1] if ms else None
 # 対戦相手別 wOBA のベイズ収縮の強さ（＝事前分布の重みを「何打席分」とみなすか）
 #   wOBA予測 = (PA×wOBA対戦 + C×wOBA全体) / (PA + C)
 #   ポスター記載の値 C = 20。PA は wOBA の分母（打席 − 敬遠 − 犠打）
@@ -184,7 +214,7 @@ def calc_runs_after(all_df: pd.DataFrame) -> pd.DataFrame:
 
             score_after, last_score = [None] * len(grp), None
             for i, body in enumerate(grp['本文'].fillna('')):
-                m = RE_SCORE.search(str(body))
+                m = find_last_score(body)
                 if m:
                     last_score = int(m.group(1)) + int(m.group(2))
                 score_after[i] = last_score
@@ -724,6 +754,8 @@ def load_career_stats(stats_dir: str) -> pd.DataFrame:
 
     all_stats = pd.concat(dfs, ignore_index=True)
     all_stats['年度'] = all_stats['年度'].astype('Int64')
+    # stats_2023.csv に完全に同じ行が重複している選手がいる（リチャード、秋広など4人）
+    all_stats = all_stats.drop_duplicates(subset=['選手名', '所属球団', '年度', '試合', '打席']).reset_index(drop=True)
     all_stats['選手名_key'] = all_stats['選手名'].apply(normalize_name)
     all_stats['OPS'] = all_stats['出塁率'] + all_stats['長打率']
     return all_stats
@@ -759,6 +791,8 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats
     batter_df: 対戦相手別・球場別打撃成績（all_batters_situational.csv 相当）の DataFrame
     stats_dir: 過去3年成績 CSV が入っているディレクトリ（任意）
     """
+    # オールスター・ポストシーズンは RE24 などの計算から除く
+    dfs = [d for d in dfs if 'game_id' not in d.columns or len(d) == 0 or is_regular_season(d['game_id'].iloc[0])]
     if dfs:
         all_df   = concat_details(dfs)
         df_runs  = calc_runs_after(all_df)
