@@ -37,7 +37,7 @@ CODE_VERSION = hashlib.md5(b''.join(
 
 from core import (
     build_model_from_dfs, predict_type_one, predict_type_all, find_batter_id, team_pitcher_weights,
-    get_player_career, get_player_current_team, get_team_avg_runs,
+    get_player_career, get_player_current_team, get_team_avg_runs_allowed,
     normalize_name, normalize_team_name, build_batter_woba, build_season_batting,
     RUNNER_LABEL, RUNNER_MAP, FORM_LEVELS, FORM_RATE, form_of,
     woba_stats, woba_breakdown, RISP_BITS as core_RISP, conditional_batter_woba, C_COND,
@@ -51,7 +51,7 @@ import game_sim
 # core.normalize_name() で正規化してから比較する。単純な文字列一致だと、
 # 表記ゆれ（全角/半角、空白、中黒など）で「対戦データ（nf3）はあるのに
 # 実測データが表示されない」という不具合が起きるため。
-from scraper import scrape_games
+from scraper import scrape_games, collect_game_ids, update_games_table
 from github_sync import (
     commit_game_files,
     load_details_from_github,
@@ -62,6 +62,8 @@ from github_sync import (
     load_pitcher_csv_from_github,
     save_players_csv_to_github,
     load_players_csv_from_github,
+    load_games_csv_from_github,
+    save_games_csv_to_github,
     get_legacy_game_ids,
 )
 from batter_scraper import scrape_all_batters, TEAMS as BATTER_TEAMS
@@ -79,9 +81,10 @@ BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 BATTER_CSV = os.path.join(BASE_DIR, 'data', 'all_batters_situational.csv')
 PITCHER_CSV = os.path.join(BASE_DIR, 'data', 'all_pitchers.csv')
 PLAYERS_CSV = os.path.join(BASE_DIR, 'data', 'players.csv')
+GAMES_CSV   = os.path.join(BASE_DIR, 'data', 'games.csv')   # 試合ID → 試合日
 GAMEDATA_DIR = os.path.join(BASE_DIR, 'data', 'gamedata')
 STATS_DIR = os.path.join(BASE_DIR, 'data', '2023~2025打撃データ')
-START_ID   = 2021038624
+START_ID   = 2021038622   # 2026年の開幕戦（3月27日 巨人-阪神）
 CURRENT_SEASON = 2026   # 「今シーズン」として表示する年（nf3 の y=0 = 当年度のデータ）
 
 RUNNER_STR_MAP = {
@@ -127,10 +130,15 @@ def load_model(token: str | None, repo_name: str | None, branch: str | None, cod
         dfs, _ = load_details_from_github(token, repo_name, branch)
         batter_df = load_batter_csv_from_github(token, repo_name, branch)
         df_players = load_players_csv_from_github(token, repo_name, branch)
+        df_games = load_games_csv_from_github(token, repo_name, branch)
     else:
         dfs = load_details_local()
         batter_df = None
         df_players = None
+        df_games = None
+    # 試合日（振替試合を日付の順に並べるのに使う）
+    if df_games is None and os.path.exists(GAMES_CSV):
+        df_games = pd.read_csv(GAMES_CSV, encoding='utf-8-sig', dtype={'試合ID': str, '日付': str})
     # 選手マスタ（投打・球速）。打者・投手のタイプ分けに使う
     if df_players is None and os.path.exists(PLAYERS_CSV):
         df_players = pd.read_csv(PLAYERS_CSV, encoding='utf-8-sig', dtype={'選手ID': str, '背番号': str})
@@ -139,7 +147,7 @@ def load_model(token: str | None, repo_name: str | None, branch: str | None, cod
     if batter_df is None:
         batter_df = pd.read_csv(BATTER_CSV, encoding='utf-8-sig')
 
-    return build_model_from_dfs(dfs, batter_df, STATS_DIR, df_players)
+    return build_model_from_dfs(dfs, batter_df, STATS_DIR, df_players, df_games)
 
 
 def reload_model():
@@ -573,11 +581,10 @@ def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers, df_seas
     with tab_bat:
         names = df_woba[['選手名', '選手名_key']].drop_duplicates()
 
-        # 所属球団（過去3年成績データの最新年度）で絞り込めるようにする
-        team_of = {}
-        if df_career is not None and not df_career.empty:
-            latest = df_career.sort_values('年度').groupby('選手名_key').tail(1)
-            team_of = dict(zip(latest['選手名_key'], latest['所属球団']))
+        # 所属球団（2026年の成績の球団。移籍した選手は打席の多い方）で絞り込めるようにする
+        per_team = df_woba.groupby(['選手名_key', '球団'])['打席'].sum().reset_index()
+        per_team = per_team.sort_values('打席').groupby('選手名_key').tail(1)
+        team_of = dict(zip(per_team['選手名_key'], per_team['球団'].map(normalize_team_name)))
         names = names.assign(所属=names['選手名_key'].map(team_of))
 
         col_t, col_q = st.columns(2)
@@ -600,10 +607,10 @@ def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers, df_seas
         if candidates and batter is None:
             st.info('選手名を入力するか、一覧から選手を選んでください。')
         elif candidates:
-            team = get_player_current_team(df_career, batter)
+            team = team_of.get(normalize_name(batter))
             st.markdown(f'### {batter}' + (f'　{team}' if team else ''))
             render_batter_stats(batter, df_woba, df_career, df_team_batting_stats, df_season)
-        st.caption('所属球団は過去3年成績データの最新年度のものです。')
+        st.caption(f'所属球団は{CURRENT_SEASON}年の成績（nf3）の球団です（移籍した選手は打席の多い方）。')
 
     with tab_pit:
         render_pitcher_stats(df_pitchers, None, key_prefix='players_pitcher')
@@ -623,15 +630,21 @@ def _first_index(options, query, key) -> None:
     return None
 
 
-def _form_caption(f: dict | None, role: str) -> str:
-    """直近の成績からの調子の判定を1行で"""
+def _form_caption(f: dict | None, role: str, season_raw=None) -> str:
+    """
+    直近の成績からの調子の判定を1行で。
+    判定の基準は「シーズンの wOBA をリーグ平均へ寄せた値」なので、生の値（条件別 wOBA ページと同じ）と並べて書く。
+    """
     if not f:
         return '直近の成績: データなし'
     unit = '試合' if role == '打者' else '登板'
     label = 'wOBA' if role == '打者' else '被wOBA'
     rec = f"{f['直近wOBA']:.3f}" if pd.notna(f['直近wOBA']) else '—'
-    return (f"直近 {int(f['直近試合数'])} {unit}（{int(f['直近打席'])} 打席）の{label} {rec}"
-            f"／シーズン {f['シーズンwOBA']:.3f} → 判定: **{f['調子']}**（選んだときだけ使います）")
+    season = (f"シーズン {season_raw:.3f}（リーグ平均へ寄せると {f['シーズンwOBA']:.3f}）"
+              if season_raw is not None and pd.notna(season_raw) else f"シーズン（リーグ平均へ寄せた値）{f['シーズンwOBA']:.3f}")
+    pa_label = '打席' if role == '打者' else '対戦打者'
+    return (f"直近 {int(f['直近試合数'])} {unit}（{pa_label} {int(f['直近打席'])}）の {label} {rec}"
+            f"／{season} → 判定: **{f['調子']}**（選んだときだけ使います）")
 
 
 def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_team_runs,
@@ -668,10 +681,15 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
         st.info('選手名を入力するか、一覧から選手を選ぶと予測を表示します。')
         return
 
-    # ---- 選手プロフィール（所属球団 + 過去3年成績） ----
-    team = get_player_current_team(df_career, batter)
+    # ---- 選手プロフィール（所属球団）----
+    # 球団は一球速報で最後に出場した試合の球団（2026年）。過去成績（2025年まで）は移籍・新人に対応できないので使わない
+    batter_id = find_batter_id(type_model, batter)
+    bt = type_model['batters']
+    team = bt.at[batter_id, '球団'] if batter_id is not None and '球団' in bt.columns else None
+    if not isinstance(team, str) or not team:
+        team = normalize_team_name(get_player_current_team(df_career, batter))
     if team:
-        st.markdown(f'**所属球団：{team}**')
+        st.markdown(f'**所属球団：{team}**（{CURRENT_SEASON}年）')
 
     st.divider()
 
@@ -679,7 +697,9 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     st.subheader('場面設定')
     col_opp, col_out = st.columns(2)
     with col_opp:
-        opponents = sorted(df_woba['区分名'].unique().tolist())
+        # 自分の球団とは対戦しないので選択肢から除く
+        opponents = [o for o in sorted(df_woba['区分名'].unique().tolist())
+                     if not team or normalize_team_name(o) != team]
         opponent  = st.selectbox('対戦相手', opponents, key='opponent_select')
         # 対戦投手: 相手チームで学習データに登板した投手（対戦打者の多い順）
         team_w = team_pitcher_weights(type_model, opponent)
@@ -709,11 +729,11 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
 
     # ---- 調子（既定は普通。直近の成績からの判定は参考に表示） ----
     st.markdown('**調子**')
-    batter_id = find_batter_id(type_model, batter)
     fc1, fc2 = st.columns(2)
     with fc1:
         batter_form = st.radio(f'打者（{batter}）', FORM_LEVELS, index=1, horizontal=True, key='batter_form')
-        st.caption(_form_caption(form_of(type_model.get('form'), '打者', batter_id), '打者'))
+        st.caption(_form_caption(form_of(type_model.get('form'), '打者', batter_id), '打者',
+                                 bt['wOBA'].get(batter_id) if batter_id is not None else None))
     with fc2:
         if pitcher == ALL_P:
             pitcher_form = st.radio(f'{opponent} の投手陣', FORM_LEVELS, index=1, horizontal=True,
@@ -722,7 +742,8 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
         else:
             pitcher_form = st.radio(f"投手（{tp.loc[pitcher, '選手名']}）", FORM_LEVELS, index=1,
                                     horizontal=True, key='pitcher_form')
-            st.caption(_form_caption(form_of(type_model.get('form'), '投手', pitcher), '投手'))
+            st.caption(_form_caption(form_of(type_model.get('form'), '投手', pitcher), '投手',
+                                     tp.at[pitcher, '被wOBA']))
     st.caption(f'好調・不調は打者の wOBA（投手は被 wOBA）を ±{FORM_RATE:.0%} 補正します。'
                '2026年のデータでは、直近の調子が次の試合の成績を当てる効果は確認できていません（参考機能）。')
 
@@ -761,7 +782,7 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
             return f'{v}' if k != '対戦球団' else f'対{v}'
         cond_txt = '・'.join(_lab(k, v) for k, v in _conds(out, runner).items())
         st.caption(f"この条件（{cond_txt}）での wOBA {_fmt3(cw['wOBA'])}（{cw['打席']} 打席）を、"
-                   f"全体の wOBA {cw['全体']:.3f} へ {C_COND} 打席分寄せて **{cw['w']:.3f}** を使います。"
+                   f"全体の wOBA（リーグ平均へ寄せた値）{cw['全体']:.3f} へ {C_COND} 打席分寄せて **{cw['w']:.3f}** を使います。"
                    '2026年のデータでは、走者・アウト・得点圏・対戦球団で絞っても予測はほとんど良くなりません'
                    '（打席が少なく偶然の影響が大きいため）。')
 
@@ -789,10 +810,12 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
         t2.metric('投手タイプ', f'{opponent} の投手全体', help='登板の多さで重み付けした平均')
     else:
         t2.metric('投手タイプ', res['投手タイプ'] or '不明')
-    avg_runs, n_team_games = get_team_avg_runs(df_team_runs, opponent)
-    t3.metric(f'{opponent} の1試合平均得点',
-              f'{avg_runs:.2f}' if avg_runs is not None else 'N/A',
-              help=f'集計試合数: {n_team_games} 試合' if n_team_games else 'データなし')
+    # 相手の投手陣・守備の強さの目安として、相手チームの1試合平均失点を出す
+    avg_ra, n_team_games = get_team_avg_runs_allowed(df_team_runs, opponent)
+    t3.metric(f'{opponent} の1試合平均失点',
+              f'{avg_ra:.2f}' if avg_ra is not None else 'N/A',
+              help=(f'レギュラーシーズン {n_team_games} 試合の平均。相手の投手陣・守備の強さの目安'
+                    if n_team_games else 'データなし'))
 
     # ---- 投手の成績（予測の「投手補正」の元） ----
     if pitcher != ALL_P:
@@ -1219,10 +1242,28 @@ def page_settings(gh_cfg):
         return
 
     st.subheader('📥 試合データ取得・更新')
+    st.caption('スポナビの日程ページに載っている試合ID を集め、まだ取得していない試合を取得します。'
+               '雨天中止の振替試合は試合ID が離れた番号になるので、ID の連番だと取りこぼします（2026年は47試合）。')
 
+    # 既定の期間: 取得済みの最後の試合日（data/games.csv）から今日まで
+    last_date = pd.Timestamp('2026-03-27').date()
+    if os.path.exists(GAMES_CSV):
+        try:
+            _g = pd.read_csv(GAMES_CSV, encoding='utf-8-sig', dtype=str)
+            if len(_g):
+                last_date = pd.to_datetime(_g['日付']).max().date()
+        except Exception:
+            pass
+    today = pd.Timestamp.now(tz='Asia/Tokyo').date()
+
+    mode = st.radio('取得方法', ['日程から（推奨）', '試合ID の連番（以前の方法）'], horizontal=True, key='fetch_mode')
     col1, col2 = st.columns(2)
     with col1:
-        count = st.number_input('取得件数（ID 連番）', min_value=1, max_value=900, value=200)
+        if mode.startswith('日程'):
+            period = st.date_input('期間（試合日）', value=(last_date, max(today, last_date)), key='fetch_period')
+            d_from, d_to = (period if isinstance(period, (tuple, list)) and len(period) == 2 else (period, period))
+        else:
+            count = st.number_input('取得件数（ID 連番）', min_value=1, max_value=900, value=200)
     with col2:
         sleep_sec = st.slider('リクエスト間隔（秒）', 1.0, 5.0, 2.0, 0.5)
 
@@ -1233,30 +1274,46 @@ def page_settings(gh_cfg):
                 gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch']
             )
 
-        scrape_start = latest_id + 1 if latest_id is not None else START_ID
+        if mode.startswith('日程'):
+            dates = [d.strftime('%Y-%m-%d') for d in pd.date_range(d_from, d_to)]
+            sched_bar = st.progress(0, text='日程ページを確認中...')
 
-        st.info(
-            f'既存: 完全 **{len(complete_ids)}** 件 / 不完全 **{len(incomplete_ids)}** 件  \n'
-            f'新規取得開始ID: **{scrape_start}** 〜 **{scrape_start + count - 1}**'
-            + (f'  /  不完全データ **{len(incomplete_ids)}** 件を再取得' if incomplete_ids else '')
-        )
+            def _on_sched(i, n, d, n_ids):
+                sched_bar.progress(i / n, text=f'日程 [{i}/{n}] {d}（試合ID {n_ids} 件）')
+            found = collect_game_ids(dates, sleep_sec=sleep_sec, on_progress=_on_sched)
+            targets = [g for g in found if g not in complete_ids and g not in incomplete_ids]
+            st.info(f'既存: 完全 **{len(complete_ids)}** 件 / 不完全 **{len(incomplete_ids)}** 件  \n'
+                    f'日程ページの試合ID **{len(found)}** 件のうち、未取得 **{len(targets)}** 件を取得します'
+                    + (f'  /  不完全データ **{len(incomplete_ids)}** 件を再取得' if incomplete_ids else ''))
+        else:
+            scrape_start = latest_id + 1 if latest_id is not None else START_ID
+            targets = list(range(scrape_start, scrape_start + count))
+            st.info(
+                f'既存: 完全 **{len(complete_ids)}** 件 / 不完全 **{len(incomplete_ids)}** 件  \n'
+                f'新規取得開始ID: **{scrape_start}** 〜 **{scrape_start + count - 1}**'
+                + (f'  /  不完全データ **{len(incomplete_ids)}** 件を再取得' if incomplete_ids else '')
+            )
 
         progress_bar  = st.progress(0, text='準備中...')
         status_area   = st.empty()
         log_container = st.container()
         collected: list[dict] = []
+        fetched: list[dict] = []      # 試合日を games.csv に記録するため
         ok, skip, err = 0, 0, 0
+
+        def _collect(result):
+            gid, card = result['game_id'], result['card']
+            collected.append({'filename': f"{gid}_{card}_details.csv", 'df': result['df_details']})
+            if result['df_score'] is not None:
+                collected.append({'filename': f"{gid}_{card}_score.csv", 'df': result['df_score']})
+            fetched.append(result)
 
         # 不完全データの再取得
         for gid in sorted(incomplete_ids):
             for result in scrape_games(gid, 1, sleep_sec=sleep_sec):
                 card = result['card'] or '---'
                 if result['status'] == 'ok':
-                    collected.append({'filename': f"{gid}_{card}_details.csv",
-                                      'df': result['df_details']})
-                    if result['df_score'] is not None:
-                        collected.append({'filename': f"{gid}_{card}_score.csv",
-                                          'df': result['df_score']})
+                    _collect(result)
                     ok += 1
                     with log_container:
                         st.text(f'🔄 {gid}  {card}  不完全データを再取得')
@@ -1265,31 +1322,27 @@ def page_settings(gh_cfg):
                     with log_container:
                         st.text(f'⚠️ {gid}  {card}  {result["message"]}')
 
-        # 新規IDのスクレイプ
-        for i, result in enumerate(scrape_games(scrape_start, count, sleep_sec=sleep_sec)):
-            pct  = (i + 1) / count
+        # 新規の試合
+        n_t = max(len(targets), 1)
+        for i, result in enumerate(scrape_games(0, 0, sleep_sec=sleep_sec, game_ids=targets)):
             gid  = result['game_id']
             card = result['card'] or '---'
             if result['status'] == 'ok':
-                collected.append({'filename': f"{gid}_{card}_details.csv",
-                                  'df': result['df_details']})
-                if result['df_score'] is not None:
-                    collected.append({'filename': f"{gid}_{card}_score.csv",
-                                      'df': result['df_score']})
+                _collect(result)
                 ok += 1
                 icon = '✅'
-            elif result['status'] == 'no_game':
-                skip += 1
+            elif result['status'] in ('no_game', 'no_events'):
+                skip += 1     # 中止・未開催の試合
                 icon = '⬜'
             else:
                 err += 1
                 icon = '⚠️'
-            progress_bar.progress(pct, text=f'[{i+1}/{count}] {gid} {card}')
+            progress_bar.progress((i + 1) / n_t, text=f'[{i+1}/{len(targets)}] {gid} {card}')
             with log_container:
-                st.text(f'{icon} {gid}  {card}  {result["message"]}')
+                st.text(f'{icon} {gid}  {result.get("date") or ""}  {card}  {result["message"]}')
 
         status_area.success(
-            f'スクレイプ完了 — 取得: {ok} 件 / スキップ: {skip} 件 / エラー: {err} 件'
+            f'スクレイプ完了 — 取得: {ok} 件 / スキップ（中止・未開催）: {skip} 件 / エラー: {err} 件'
         )
 
         if not collected:
@@ -1315,6 +1368,14 @@ def page_settings(gh_cfg):
         else:
             st.warning(f'{ok_cnt} 件成功 / {fail_cnt} 件失敗')
 
+        # 試合日（data/games.csv）も更新する
+        df_games_old = load_games_csv_from_github(gh_cfg['token'], gh_cfg['repo_name'], gh_cfg['branch'])
+        if df_games_old is None and os.path.exists(GAMES_CSV):
+            df_games_old = pd.read_csv(GAMES_CSV, encoding='utf-8-sig', dtype=str)
+        ok_g, msg_g = save_games_csv_to_github(gh_cfg['token'], gh_cfg['repo_name'],
+                                               update_games_table(df_games_old, fetched), gh_cfg['branch'])
+        (st.success if ok_g else st.warning)(f'試合日（games.csv）: {msg_g}')
+
         st.info('データキャッシュをクリアして再計算します...')
         reload_model()
 
@@ -1331,6 +1392,7 @@ def page_settings(gh_cfg):
         '- 状況別打者成績: `data/all_batters_situational.csv`\n'
         '- 投手成績: `data/all_pitchers.csv`\n'
         '- 選手マスタ（投打・球速）: `data/players.csv`\n'
+        '- 試合日: `data/games.csv`（振替試合を日付の順に並べるのに使う）\n'
         '- 過去3年成績: `data/2023~2025打撃データ/stats_YYYY.csv`'
     )
 
@@ -1425,15 +1487,22 @@ def _sim_team_inputs(sim, type_model, side: str, label: str, team_default: int, 
                        horizontal=True, key=f'sim_spform_{side}_{team}_{sp}_{auto_form}')
 
     batters = game_sim.team_batters(sim, team)
-    default = game_sim.last_lineup(sim, team) or batters[:9]
-    st.caption('打順（既定は今季最後の試合のスタメン）')
+    default = list(game_sim.last_lineup(sim, team) or batters[:9])
+    # 最後の試合が DH なし（先発投手が打順に入っていた）なら、その打順に選んだ先発投手を入れる
+    sp_slot = game_sim.last_lineup_pitcher_slot(sim, team)
+    if sp_slot is not None:
+        default[sp_slot] = sp
+    st.caption('打順（既定は今季最後の試合のスタメン）'
+               + ('。DH なしの試合だったので、投手の打順には選んだ先発投手が入ります' if sp_slot is not None else ''))
     lineup, bforms = [], []
     for i in range(9):
         c1, c2 = st.columns([3, 2])
         opts = batters if default[i] in batters else [default[i]] + batters
+        # 投手の打順は、先発投手を選び直したら入れ替わるように key に先発投手を含める
+        key = f'sim_bat_{side}_{team}_{i}' + (f'_{sp}' if i == sp_slot else '')
         with c1:
             pid = st.selectbox(f'{i + 1}番', opts, index=opts.index(default[i]),
-                               format_func=lambda x: names.get(x, x), key=f'sim_bat_{side}_{team}_{i}')
+                               format_func=lambda x: names.get(x, x), key=key)
         auto = (form_of(forms, '打者', pid) or {}).get('調子', '普通')
         with c2:
             f = st.selectbox('調子', FORM_LEVELS, index=FORM_LEVELS.index(auto if auto_form else '普通'),
@@ -1594,15 +1663,16 @@ def page_woba(type_model):
             df = df[df['区分'] == 'ポストシーズン']
         elif period != '全試合':
             df = df[df['区分'] == 'レギュラーシーズン']
-            mid = np.median(df['gid'].unique())
+            # 前半・後半・直近は試合日の順（'順'）で決める。振替試合は試合ID の順と一致しないため
+            mid = np.median(df['順'].unique())
             if period == 'シーズン前半':
-                df = df[df['gid'] <= mid]
+                df = df[df['順'] <= mid]
             elif period == 'シーズン後半':
-                df = df[df['gid'] > mid]
+                df = df[df['順'] > mid]
             elif period.startswith('直近') and player is not None:
                 n = int(period.replace('直近', '').replace('試合', ''))
-                last = sorted(df['gid'].unique())[-n:]
-                df = df[df['gid'].isin(last)]
+                last = sorted(df['順'].unique())[-n:]
+                df = df[df['順'].isin(last)]
         # 全部選ばれている条件では絞り込まない（左右・タイプが不明な打席も残す）
         for col, sel, full in (('相手の左右', lr, ['右', '左']), ('相手のタイプ', typ, types),
                                ('対戦球団', tms, teams), ('アウト', outs, [0, 1, 2]),

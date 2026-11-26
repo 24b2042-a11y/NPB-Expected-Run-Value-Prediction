@@ -174,6 +174,10 @@ def _parse_recap(soup: BeautifulSoup) -> pd.DataFrame:
         if not (p_bat and div_cont and div_text):
             continue
 
+        # 打席の動画へのリンク（「0:48【1回裏】…」の見出し）は本文に入れない（2026-11-26）
+        for video in div_text.find_all('a', class_='bb-liveText__itemVideoLink'):
+            video.decompose()
+
         bat_str  = p_bat.get_text(strip=True)
         cont_str = div_cont.get_text(strip=True)
         full_str = div_text.get_text(strip=True)
@@ -215,9 +219,107 @@ def _clean_card(title_text: str) -> str:
     return RE_UNSAFE.sub('_', m.group(1)) if m else 'Match'
 
 
-def has_player_columns(df: pd.DataFrame | None) -> bool:
-    """_details.csv が打者ID・投手ID の列を持つ（2026-11 以降の形式）か"""
-    return df is not None and {'打者ID', '投手ID'}.issubset(df.columns)
+RE_TITLE_DATE = re.compile(r'(\d{4})年(\d{1,2})月(\d{1,2})日')
+
+
+def _title_date(title_text: str) -> str | None:
+    """タイトル「2026年4月1日 東京ヤクルトスワローズvs.広島東洋カープ …」から '2026-04-01' を取り出す"""
+    m = RE_TITLE_DATE.search(title_text or '')
+    return f'{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}' if m else None
+
+
+def parse_game_html(gid: int, html: str) -> dict:
+    """
+    一球速報（テキスト速報）ページの HTML を解析する（scrape_games と同じ dict を返す）。
+    ブラウザなどで保存した HTML を、手元で _details.csv / _score.csv にするときにも使う。
+    """
+    from io import StringIO
+
+    result = dict(game_id=gid, card='', date=None, df_details=None, df_score=None, status='', message='')
+    soup = BeautifulSoup(html, 'html.parser')
+    title_text = soup.title.text.strip() if soup.title else ''
+    if not title_text or 'エラー' in title_text or '見つかりません' in title_text or '表示できません' in title_text:
+        result.update(status='no_game', message='試合ページではない')
+        return result
+    # 一軍の試合だけ（ファームなどのページを誤って保存しない）
+    if 'プロ野球' not in title_text or 'ファーム' in title_text:
+        result.update(status='no_game', message=f'一軍の試合ではない: {title_text[:40]}')
+        return result
+
+    result['card'] = _clean_card(title_text)
+    result['date'] = _title_date(title_text)
+
+    # スコアボード
+    try:
+        dfs = pd.read_html(StringIO(html))
+        if dfs:
+            result['df_score'] = dfs[0]
+    except Exception:
+        pass
+
+    # 打席イベント
+    df_events = _parse_recap(soup)
+    if df_events.empty:
+        result.update(status='no_events', message='打席イベントなし（中止、またはテキスト速報未掲載）')
+    else:
+        n_nop = int(df_events['投手ID'].isna().sum())
+        msg = f'{len(df_events)} 打席取得'
+        if n_nop:
+            msg += f'（投手不明 {n_nop} 打席）'
+        result.update(status='ok', df_details=df_events, message=msg)
+    return result
+
+
+# ============================================================
+# 日程ページから試合ID を集める（2026-11-26）
+#   雨天中止の振替試合は、試合ID が元の日程とは離れた大きい番号になるため、
+#   「取得済みの最大ID＋1 から連番」では取りこぼす（2026年は開幕戦2試合＋振替試合45試合が抜けていた）。
+#   日程ページ（https://baseball.yahoo.co.jp/npb/schedule/?date=YYYY-MM-DD）に載っている試合ID を集める。
+# ============================================================
+RE_GAME_LINK = re.compile(r'/npb/game/(\d{10})/')
+
+
+def collect_game_ids(dates, sleep_sec: float = 2.0, on_progress=None) -> list[int]:
+    """
+    dates（'YYYY-MM-DD' の並び）の日程ページに載っている試合ID を集めて昇順で返す。
+    日程ページには前後の日の試合が載ることもあるが、取得時にタイトルの日付を記録するので問題ない。
+    on_progress(i, n, date, n_ids)
+    """
+    ids = set()
+    dates = list(dates)
+    for i, d in enumerate(dates, 1):
+        try:
+            resp = requests.get('https://baseball.yahoo.co.jp/npb/schedule/', params={'date': d},
+                                headers=HEADERS, timeout=15)
+            if resp.status_code == 200:
+                ids.update(int(x) for x in RE_GAME_LINK.findall(resp.text))
+        except requests.RequestException:
+            pass
+        if on_progress:
+            on_progress(i, len(dates), d, len(ids))
+        time.sleep(sleep_sec)
+    return sorted(ids)
+
+
+def update_games_table(df_games: pd.DataFrame | None, results: list[dict]) -> pd.DataFrame:
+    """
+    data/games.csv（試合ID, 日付, ビジター, ホーム）に、取得した試合（scrape_games / parse_game_html の結果）を
+    追加・更新して返す。カード名は「ホームvs.ビジター」。
+    """
+    cols = ['試合ID', '日付', 'ビジター', 'ホーム']
+    base = (df_games[cols].copy() if df_games is not None and not df_games.empty
+            else pd.DataFrame(columns=cols))
+    base['試合ID'] = base['試合ID'].astype(str)
+    rows = []
+    for r in results:
+        if r.get('status') != 'ok' or not r.get('date'):
+            continue
+        home, away = (r['card'].split('vs.', 1) + [''])[:2] if 'vs.' in r['card'] else ('', '')
+        rows.append({'試合ID': str(r['game_id']), '日付': r['date'], 'ビジター': away, 'ホーム': home})
+    if rows:
+        new = pd.DataFrame(rows, columns=cols)
+        base = pd.concat([base[~base['試合ID'].isin(new['試合ID'])], new], ignore_index=True)
+    return base.sort_values(['日付', '試合ID']).reset_index(drop=True)
 
 
 # ============================================================
@@ -241,13 +343,12 @@ def scrape_games(
         df_score  : pd.DataFrame | None
         status    : 'ok' | 'no_game' | 'no_events' | 'error'
         message   : str
+        date      : str | None  試合日（タイトルから。'YYYY-MM-DD'）
     """
-    from io import StringIO
-
     ids = list(game_ids) if game_ids is not None else [start_id + i for i in range(count)]
     for gid in ids:
         url = f"https://baseball.yahoo.co.jp/npb/game/{gid}/text"
-        result = dict(game_id=gid, card='', df_details=None,
+        result = dict(game_id=gid, card='', date=None, df_details=None,
                       df_score=None, status='', message='')
 
         try:
@@ -266,37 +367,7 @@ def scrape_games(
             continue
 
         resp.encoding = 'utf-8'
-        soup = BeautifulSoup(resp.text, 'html.parser')
-
-        title_text = soup.title.text.strip() if soup.title else ''
-        if not title_text or 'エラー' in title_text or '見つかりません' in title_text:
-            result.update(status='no_game', message='試合ページではない')
-            yield result
-            time.sleep(sleep_sec)
-            continue
-
-        card = _clean_card(title_text)
-        result['card'] = card
-
-        # スコアボード
-        try:
-            dfs = pd.read_html(StringIO(resp.text))
-            if dfs:
-                result['df_score'] = dfs[0]
-        except Exception:
-            pass
-
-        # 打席イベント
-        df_events = _parse_recap(soup)
-        if df_events.empty:
-            result.update(status='no_events',
-                          message='打席イベントなし（テキスト速報未掲載）')
-        else:
-            n_nop = int(df_events['投手ID'].isna().sum())
-            msg = f'{len(df_events)} 打席取得'
-            if n_nop:
-                msg += f'（投手不明 {n_nop} 打席）'
-            result.update(status='ok', df_details=df_events, message=msg)
+        result = parse_game_html(gid, resp.text)
 
         yield result
         time.sleep(sleep_sec)
@@ -355,19 +426,37 @@ def _fetch_and_save(data_dir: str, targets: list[int], sleep_sec: float) -> None
     import os
 
     n_ok = n_ng = 0
+    fetched = []
     for i, r in enumerate(scrape_games(0, 0, sleep_sec=sleep_sec, game_ids=targets), 1):
         gid, card = r['game_id'], r['card']
         if r['status'] == 'ok':
-            r['df_details'].to_csv(os.path.join(data_dir, f'{gid}_{card}_details.csv'),
-                                   index=False, encoding='utf-8-sig')
-            if r['df_score'] is not None:
-                r['df_score'].to_csv(os.path.join(data_dir, f'{gid}_{card}_score.csv'),
-                                     index=False, encoding='utf-8-sig')
+            save_game_files(data_dir, r)
+            fetched.append(r)
             n_ok += 1
         else:
             n_ng += 1
-        print(f'[{i}/{len(targets)}] {gid} {card} {r["status"]} {r["message"]}')
+        print(f'[{i}/{len(targets)}] {gid} {card} {r.get("date") or ""} {r["status"]} {r["message"]}')
+    update_games_csv(os.path.join(os.path.dirname(data_dir), 'games.csv'), fetched)
     print(f'完了: 成功 {n_ok} / 失敗 {n_ng}')
+
+
+def save_game_files(data_dir: str, r: dict) -> None:
+    """取得結果を data/gamedata/{gid}_{card}_details.csv / _score.csv に保存する（改行は LF）"""
+    import os
+    gid, card = r['game_id'], r['card']
+    r['df_details'].to_csv(os.path.join(data_dir, f'{gid}_{card}_details.csv'),
+                           index=False, encoding='utf-8-sig', lineterminator='\n')
+    if r['df_score'] is not None:
+        r['df_score'].to_csv(os.path.join(data_dir, f'{gid}_{card}_score.csv'),
+                             index=False, encoding='utf-8-sig', lineterminator='\n')
+
+
+def update_games_csv(path: str, results: list[dict]) -> None:
+    """data/games.csv に取得した試合の試合日を追加する"""
+    import os
+    old = pd.read_csv(path, encoding='utf-8-sig', dtype=str) if os.path.exists(path) else None
+    df = update_games_table(old, results)
+    df.to_csv(path, index=False, encoding='utf-8-sig', lineterminator='\n')
 
 
 if __name__ == '__main__':

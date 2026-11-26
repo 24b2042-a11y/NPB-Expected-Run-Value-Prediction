@@ -4,6 +4,7 @@ game_sim.py — スタメンと先発投手から1試合をシミュレーショ
 流れ
   1. 打席ごとの結果の確率（7種類: 三振・凡退・四死球・単打・二塁打・三塁打・本塁打）
        打者の割合と投手の割合をリーグ平均へ収縮（C = 100 打席）し、オッズ比法（一般化 log5）で合成
+       投手の打撃（セ・リーグの DH なしの試合）は、リーグ全体ではなく「投手の打席の平均」へ収縮する
          p(結果) ∝ 打者の割合 × 投手の割合 ÷ リーグの割合      （Haechrel 2014）
        さらに打者タイプ × 投手タイプの相性（16マス × 7結果の倍率）と、調子（好調・不調）を掛ける
   2. 走者・アウトの進み方
@@ -13,6 +14,8 @@ game_sim.py — スタメンと先発投手から1試合をシミュレーショ
   3. 投手交代: 先発は今季の先発登板の対戦打者数（その投手の登板からランダムに1つ）で降板し、
        そのあとはチームの救援投手全体（今季の救援での対戦打者数で重み付け）が投げる
   4. 9回まで。9回裏以降はホームがリードした時点で終了（サヨナラ）。12回で同点なら引き分け
+  既定のスタメンはそのチームの最後の試合（試合日の順）のもの。その試合で先発投手が打席に立っていた
+  （DH なし）ときは、その打順に選んだ先発投手を入れる（アプリの _sim_team_inputs）
 
 計算は core.py の一球速報の処理（calc_runs_after, add_result_columns, attach_player_info）と、
 相性モデル（build_type_model）のタイプ判定を使う。
@@ -21,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from core import (RUNNER_MAP, add_result_columns, attach_player_info, normalize_player_id,
-                  normalize_team_name, batter_type_label, pitcher_type_label, FORM_RATE, FORM_SIGN)
+                  normalize_team_name, batter_type_label, pitcher_type_label, game_order, FORM_RATE, FORM_SIGN)
 
 EVENTS = ['SO', 'OUT', 'BB', '1B', '2B', '3B', 'HR']
 EVENT_LABEL = {'SO': '三振', 'OUT': '凡退', 'BB': '四死球', '1B': '単打', '2B': '二塁打', '3B': '三塁打', 'HR': '本塁打'}
@@ -58,16 +61,30 @@ def build_sim_model(df_runs: pd.DataFrame, df_players: pd.DataFrame | None, type
     d['打者球団'] = pd.Series(bat_raw, index=d.index).apply(normalize_team_name)
     d['守備球団'] = pd.Series(fld_raw, index=d.index).apply(normalize_team_name)
 
+    d['順'] = game_order(d)   # 試合日の順（振替試合は試合ID の順と一致しない）
     pa = d[d['ev'].notna()].copy()
     league = pa['ev'].value_counts(normalize=True).reindex(EVENTS).fillna(0).to_numpy()
 
-    def _rates(col):
+    # 投手の打撃: 投手として対戦した打者数が、自分の打席数以上の選手（二刀流で打者として出ている選手は除く）
+    bf_as_pitcher = pa['投手ID'].apply(normalize_player_id).value_counts()
+    pa_as_batter = pa['打者ID'].apply(normalize_player_id).value_counts()
+    pb = pa_as_batter.to_frame('pa')
+    pb['bf'] = pd.Series(pb.index, index=pb.index).map(bf_as_pitcher).fillna(0)
+    pitcher_batters = set(pb.index[pb['bf'] >= pb['pa']])
+    is_pb = pa['打者ID'].apply(normalize_player_id).isin(pitcher_batters)
+    pitcher_bat = (pa.loc[is_pb, 'ev'].value_counts(normalize=True).reindex(EVENTS).fillna(0).to_numpy()
+                   if is_pb.sum() >= 50 else league)
+
+    def _rates(col, prior_of=None):
         cnt = pd.crosstab(pa[col], pa['ev']).reindex(columns=EVENTS, fill_value=0)
         n = cnt.sum(axis=1).to_numpy()[:, None]
-        rates = (cnt.to_numpy() + C_RATE * league) / (n + C_RATE)
+        prior = (np.array([prior_of(i) for i in cnt.index]) if prior_of is not None
+                 else np.tile(league, (len(cnt), 1)))
+        rates = (cnt.to_numpy() + C_RATE * prior) / (n + C_RATE)
         return pd.DataFrame(rates, index=cnt.index, columns=EVENTS), cnt.sum(axis=1)
 
-    bat_rates, bat_n = _rates('打者ID')
+    bat_rates, bat_n = _rates('打者ID', lambda i: pitcher_bat if normalize_player_id(i) in pitcher_batters
+                                                  else league)
     pit_rates, pit_n = _rates('投手ID')
 
     # --- 相性（タイプ × タイプ × 結果）の倍率 ---
@@ -138,11 +155,12 @@ def build_sim_model(df_runs: pd.DataFrame, df_players: pd.DataFrame | None, type
         'pit': {k: v for k, v in zip(pit_rates.index, pit_rates.to_numpy())},
         'bats': hands['打'].dropna().to_dict(), 'arm': hands['投'].dropna().to_dict(),
         'power': b['長打型'].to_dict(), 'fast': p['速球派'].to_dict(),
+        'pitcher_bat': pitcher_bat,   # 打席のない投手が打つときの割合（投手の打席の平均）
     }
     return {'lookup': lookup, 'league': league, 'bat_rates': bat_rates, 'bat_n': bat_n, 'pit_rates': pit_rates, 'pit_n': pit_n,
             'type_mult': type_mult, 'trans': trans, 'sp_bf': sp_bf, 'bullpen': bullpen,
             'team_starters': team_starters, 'names': names, 'hands': hands, 'type_model': type_model,
-            'pbp': d[['game_id', 'イニング', 'side', '打順', '打者ID', '投手ID', '先発', '打者球団', '守備球団']]}
+            'pbp': d[['game_id', '順', 'イニング', 'side', '打順', '打者ID', '投手ID', '先発', '打者球団', '守備球団']]}
 
 
 # ============================================================
@@ -153,7 +171,9 @@ def pa_probs(sim: dict, batter_id, pitcher_id, batter_form: str = '普通', pitc
     lg = sim['league']
     lk = sim['lookup']
     bid, pid = normalize_player_id(batter_id), normalize_player_id(pitcher_id)
-    br = lk['bat'].get(bid, lg)
+    br = lk['bat'].get(bid)
+    if br is None:   # 打席のない選手: 投手なら投手の打撃の平均、そうでなければリーグ平均
+        br = lk.get('pitcher_bat', lg) if bid in lk['pit'] else lg
     pr = lk['pit'].get(pid, lg)
     raw = br * pr / lg
     prob = raw / raw.sum()
@@ -334,16 +354,36 @@ def simulate_many(sim: dict, away: dict, home: dict, n: int = 1000, seed: int | 
 # ============================================================
 # 既定のスタメン・先発（アプリの初期値用）
 # ============================================================
+def _last_game(sim: dict, team: str) -> pd.DataFrame:
+    """そのチームの最後の試合（試合日の順。'順' の列がなければ試合ID の順）の打席"""
+    d = sim['pbp']
+    d = d[(d['打者球団'] == team) | (d['守備球団'] == team)]
+    if d.empty:
+        return d
+    key = d['順'] if '順' in d.columns else d['game_id'].astype(int)
+    return d[key == key.max()]
+
+
 def last_lineup(sim: dict, team: str) -> list[str]:
     """そのチームの直近の試合の打順1〜9番（最初に打席に立った選手）"""
-    d = sim['pbp']
-    d = d[d['打者球団'] == team]
-    if d.empty:
-        return []
-    gid = d['game_id'].astype(int)
-    last = d[gid == gid.max()]
+    last = _last_game(sim, team)
+    last = last[last['打者球団'] == team]
     first = last.dropna(subset=['打順']).drop_duplicates('打順').sort_values('打順')
     return [normalize_player_id(x) for x in first['打者ID'].head(9)]
+
+
+def last_lineup_pitcher_slot(sim: dict, team: str) -> int | None:
+    """
+    直近の試合で、そのチームの先発投手が打順に入っていた（DH なしの試合）ときの打順の位置（0〜8）。
+    DH ありの試合なら None。アプリではこの位置に、選んだ先発投手を入れる。
+    """
+    last = _last_game(sim, team)
+    fld = last[(last['守備球団'] == team) & last['先発']]
+    if fld.empty:
+        return None
+    sp = normalize_player_id(fld['投手ID'].iloc[0])
+    lineup = last_lineup(sim, team)
+    return lineup.index(sp) if sp in lineup else None
 
 
 def game_setup(df_game: pd.DataFrame) -> dict:

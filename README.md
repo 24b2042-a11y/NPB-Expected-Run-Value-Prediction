@@ -5,19 +5,23 @@
 ```
 .
 ├── app.py                         # Streamlit アプリ本体
-├── core.py                        # RE24・wOBA 計算ロジック
-├── scraper.py                     # スポナビ PBP スクレイパー（打者ID・対戦投手つき）
+├── core.py                        # RE24・wOBA・相性モデル・調子・条件別 wOBA の計算
+├── game_sim.py                    # 試合シミュレーション（モンテカルロ法）
+├── validate.py                    # 検証（シーズンで学習 → ポストシーズンでテスト）
+├── scraper.py                     # スポナビ PBP スクレイパー（打者ID・対戦投手つき。日程ページから試合ID を収集）
 ├── player_scraper.py              # スポナビ選手ページ → 選手マスタ（投打・球速）
 ├── batter_scraper.py              # nf3 打者の対戦相手別・球場別成績
 ├── pitcher_scraper.py             # nf3 投手成績
 ├── github_sync.py                 # GitHub 自動コミット
 ├── requirements.txt
 ├── .streamlit/
-│   └── secrets.toml.example       # Secrets テンプレート（push しない）
+│   └── secrets.toml.example       # Secrets のテンプレート（コピーして secrets.toml を作る。secrets.toml は push しない）
 └── data/
     ├── all_batters_situational.csv
     ├── all_pitchers.csv
     ├── players.csv                # 選手マスタ（選手ID・投打・ストレート平均球速など）
+    ├── games.csv                  # 試合ID → 試合日・ビジター・ホーム（振替試合を日付の順に並べるのに使う）
+    ├── 2023~2025打撃データ/       # 過去3年の打撃成績（stats_YYYY.csv）
     └── gamedata/                  # PBP データ（アプリから自動追加）
         └── *_details.csv          # 打者ID・投手名・投手ID・攻撃 の列を含む（2026-11〜）
 ```
@@ -43,7 +47,7 @@ git add data/ && git commit -m "PBP に投手ID を追加、players.csv を追�
 
 ```bash
 git init && git add . && git commit -m "initial"
-git remote add origin https://github.com/<your-name>/baseball-re24.git
+git remote add origin https://github.com/<your-name>/NPB-Expected-Run-Value-Prediction.git
 git push -u origin main
 ```
 
@@ -58,7 +62,7 @@ Streamlit Cloud の **Settings > Secrets** に貼り付け：
 ```toml
 [github]
 token     = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-repo_name = "your-username/baseball-re24"
+repo_name = "your-username/NPB-Expected-Run-Value-Prediction"
 branch    = "main"
 ```
 
@@ -70,17 +74,23 @@ branch    = "main"
 サイドバーでページを切り替える。
 
 ### 🔮 メイン（予測）
-- 打者・対戦相手・アウト・ランナー状態を選ぶと、補正後期待得点を表示
+- 打者・対戦相手（打者自身の球団は出ない）・対戦投手・アウト・ランナー状態を選ぶと、補正後期待得点を表示
 - RE24 の表（ヒートマップ）、状況別の実測打率、全 24 場面の一覧、打者の個人成績、投手成績
 - RE24 はレギュラーシーズンの試合だけで計算する（オールスター・ポストシーズンは `core.NON_REGULAR_IDS` で除外）
 
+### 🎮 試合シミュレーション
+スタメンと先発投手を入れて、勝率・予想スコア・1試合の流れを出す（下の「試合シミュレーション」）。
+
+### 📈 条件別 wOBA
+打者（投手なら被 wOBA）を、期間・相手の左右やタイプ・走者・アウトなどで絞って計算する。
+
 ### 👥 選手成績
-打者・投手の成績、今シーズンの成績一覧。
+打者・投手の成績、今シーズンの成績一覧。所属球団は2026年の成績（nf3）の球団。
 
 ### ⚙️ 設定（データ更新）
 | 項目 | 内容 |
 |---|---|
-| 試合データ取得・更新 | スポナビ一球速報を「取得済みの最大の試合ID＋1」から連番で取得（オールスターの ID は開始位置の計算から除く）。「試合終了」「コールド」がなく打席数の少ない試合は取り直す |
+| 試合データ取得・更新 | 既定は「日程から」: 期間（試合日）の日程ページに載っている試合ID を集めて、未取得の試合を取得し、試合日を `data/games.csv` に記録する。雨天中止の振替試合は試合ID が離れた番号になるので、以前の「取得済みの最大の試合ID＋1 から連番」では取りこぼす（2026年は開幕戦2試合＋振替試合45試合）。「試合終了」「コールド」がなく打席数の少ない試合は取り直す |
 | 既存試合の再取得 | 打者ID・投手ID の列がない旧形式の試合を取り直す |
 | 選手マスタの更新 | 投打・球速を `data/players.csv` に保存 |
 | 打者・投手の成績更新 | nf3 から取得。12球団そろっていない等の問題があれば保存しない |
@@ -89,12 +99,12 @@ branch    = "main"
 
 ```bash
 python scraper.py --refetch                     # 旧形式の試合を新形式で取り直す
-python scraper.py --ids 2021039474-2021039495   # 指定した試合ID（ポストシーズンなど）を取得
+python scraper.py --ids 2021039474-2021039495   # 指定した試合ID（ポストシーズンなど）を取得。試合日を data/games.csv に追加
 python player_scraper.py --from-teams           # 12球団の成績ページに載る選手の投打・球速
-python batter_scraper.py                        # nf3 の打者成績（12球団そろわなければ保存しない）
+python batter_scraper.py                        # nf3 の打者成績（取得に失敗した選手は最後に取り直す。12球団そろわなければ保存しない）
 ```
 
-取得後は `git add data/ && git commit && git push`。
+取得後は `git add data/ && git commit && git push`。CSV は改行 LF で保存する（Windows の CRLF だと中身が同じでも差分になる）。
 
 ## 検証（validate.py）
 
@@ -102,11 +112,11 @@ python batter_scraper.py                        # nf3 の打者成績（12球団
 
 ```bash
 python validate.py                          # 学習=シーズン、テスト=ポストシーズン
-python validate.py --split season-tail      # 補助: シーズン内の後ろ20%をテスト
+python validate.py --split season-tail      # 補助: シーズン内の後ろ20%（試合日の順）をテスト
 ```
 
 - 実測値: その打席以降のイニング得点（runs_after）と、打席の得点価値 ΔRE の両方で評価
-- 比較: RE24 のみ／乗法型（アプリの式）／加法型（RE24 + k(wOBA − リーグ平均)）× 打者 wOBA の作り方
+- 比較: RE24 のみ／乗法型（以前のアプリの式）／加法型（RE24 + k(wOBA − リーグ平均)。今のアプリの式）× 打者 wOBA の作り方
 - 結果は `results/` に CSV で出力（git には入れない）
 
 ## 補正ロジック（2026-11-26〜 打者タイプ × 投手タイプの相性モデル）
@@ -118,7 +128,7 @@ w = 打者wOBA + (投手の被wOBA − リーグ平均) + 相性[打者タイプ
 
 - すべてレギュラーシーズンの一球速報から計算（`core.build_type_model`）
 - 打者wOBA・投手の被wOBA は打席の少ない選手をリーグ平均へ収縮（C = 100 打席）
-- k は「打席の wOBA の値」と「打席の得点価値 ΔRE」の関係から推定（約 0.76）
+- k は「打席の wOBA の値」と「打席の得点価値 ΔRE」の関係から推定（2026年で約 0.74）
 - 打者タイプ: 打席（右/左。両打は投手の逆側）× 長打型/巧打型（ISO が中央値以上で長打型）
 - 投手タイプ: 投げ腕（右/左）× 速球派/技巧派（速球の平均球速と奪三振率の z 値の平均が 0 以上で速球派）
 - 相性: 4 × 4 = 16 マス。打者・投手の実力から期待される wOBA との差を、打席の少ないマスほど 0 に寄せる（C = 300）
@@ -167,3 +177,17 @@ w = 打者wOBA + (投手の被wOBA − リーグ平均) + 相性[打者タイプ
 - メインの予測でも条件別 wOBA を使える（`core.conditional_batter_woba`）。既定は「走者・アウト」。
   条件での wOBA を打者の全体 wOBA へ 200 打席分寄せた値を打者 wOBA に使う。
   検証では走者・アウト・得点圏・対戦球団で絞っても予測はほぼ変わらない（打席が少なく偶然の影響が大きい）
+
+## 打席結果の判定（core.classify_result）
+
+一球速報の本文のキーワードで判定する（core.RESULT_PATTERNS。上から順に最初に当てはまったもの）。
+- 本文の後ろに付いている動画の見出し（「0:27【8回表】…4奪三振…!!」）は取り除いてから判定する（`core.strip_video_caption`。
+  2026年は約1,500打席に付いていて、見出しの「奪三振」「安打」で64打席を誤判定していた）
+- バント: スリーバント失敗は三振、送りバント失敗・バントの凡打・併殺は凡退、セーフティバント・プッシュバントで一塁に生きたら単打、
+  スクイズ成功は犠打（以前は「バント」を含むだけで犠打にしていたため、失敗も犠打として wOBA の分母から抜けていた）
+- 失策・野選での出塁は wOBA の慣例どおり凡退。盗塁死・けん制死で攻撃が終わった行は打席ではないので判定不能（UNKNOWN）のまま
+
+## 試合の並び順（data/games.csv）
+
+調子の「直近の試合」、シーズン内の時系列分割、条件別 wOBA の前半/後半・直近N試合、シミュレーションの既定のスタメン（最後の試合）は、
+試合ID ではなく試合日の順に並べる（`core.game_order`）。振替試合や日程が後から決まった試合は、試合ID の順と日付の順が一致しないため。

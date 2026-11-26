@@ -54,10 +54,39 @@ def find_last_score(body) -> re.Match | None:
     """
     ms = list(RE_SCORE.finditer(str(body)))
     return ms[-1] if ms else None
-# 対戦相手別 wOBA のベイズ収縮の強さ（＝事前分布の重みを「何打席分」とみなすか）
-#   wOBA予測 = (PA×wOBA対戦 + C×wOBA全体) / (PA + C)
-#   ポスター記載の値 C = 20。PA は wOBA の分母（打席 − 敬遠 − 犠打）
-SHRINK_C = 20
+
+# ============================================================
+# 試合日（data/games.csv）と試合の並び順（2026-11-26）
+#   雨天中止の振替試合は、試合ID が元の日程とは離れた大きい番号（2021042970〜 など）になる。
+#   そのため「直近の試合」「シーズンの後半」などの並びは試合ID ではなく試合日で決める。
+#   games.csv の列: 試合ID, 日付（YYYY-MM-DD）, ビジター, ホーム
+# ============================================================
+GAMES_COLUMNS = ['試合ID', '日付', 'ビジター', 'ホーム']
+
+
+def attach_game_dates(df: pd.DataFrame, df_games: pd.DataFrame | None) -> pd.DataFrame:
+    """打席データ（game_id の列がある DataFrame）に試合日の列 '日付'（YYYY-MM-DD）を付ける"""
+    df = df.copy()
+    if df_games is None or df_games.empty or '日付' not in df_games.columns:
+        df['日付'] = None
+        return df
+    dates = dict(zip(df_games['試合ID'].astype(str), df_games['日付'].astype(str)))
+    df['日付'] = df['game_id'].astype(str).map(dates)
+    return df
+
+
+def game_order(df: pd.DataFrame) -> pd.Series:
+    """
+    各行の試合の並び順（試合日 → 試合ID の順に 0, 1, 2, …）を返す。
+    '日付' の列がない・空の試合は、試合ID の順で日付のある試合の後ろに並ぶ（以前と同じ ID 順）。
+    """
+    gid = df['game_id'].astype(int)
+    date = df['日付'] if '日付' in df.columns else pd.Series(None, index=df.index, dtype=object)
+    games = (pd.DataFrame({'gid': gid.to_numpy(), '日付': date.to_numpy()})
+             .drop_duplicates('gid').sort_values(['日付', 'gid'], na_position='last'))
+    rank = pd.Series(np.arange(len(games)), index=games['gid'].to_numpy())
+    return gid.map(rank)
+
 
 # 球団の正式名称（カード表記）→ 状況別データの区分名に統一するマッピング
 # ※ raw 側は normalize_team_name 内で NFKC 正規化してから照合するため、
@@ -109,7 +138,8 @@ def normalize_team_name(raw: str | None) -> str | None:
     """カードの長い球団名を状況別データの区分名（短縮名）に変換する"""
     if not isinstance(raw, str) or not raw:
         return None
-    s = unicodedata.normalize('NFKC', raw)
+    # 過去成績の「阪　神」「読　売」のように間に空白が入る表記もあるので、空白は除いてから照合する
+    s = re.sub(r'\s', '', unicodedata.normalize('NFKC', raw))
     for key, target in TEAM_NAME_MAP:
         if unicodedata.normalize('NFKC', key) in s:
             # target を正規化した「代表表記」に統一して返す
@@ -133,6 +163,15 @@ RESULT_PATTERNS = [
     ('HBP', re.compile(r'死球|デッドボール')),
     ('SO',  re.compile(r'三振|振り逃げ')),
     ('1B',  re.compile(r'ヒット|安打')),
+    # バント・スクイズ（2026-11-26 追加。「バント」を含むだけで犠打にしていたため、失敗も犠打になっていた）
+    #   2ストライクからのバント失敗（スリーバント失敗）は三振、送りバント失敗・バントの凡打・併殺は凡退、
+    #   セーフティバント・プッシュバントで一塁に生きたら単打（失策・野選なら凡退扱い）、
+    #   スクイズ成功は犠打（野選で打者が生きても犠打）
+    ('SO',  re.compile(r'スリーバント[^。]*?失敗')),
+    ('SAC', re.compile(r'スクイズを?(?:成功|決め)')),
+    ('OUT', re.compile(r'バント[^。]*?(?:失敗|併殺|ダブルプレー|ゴロ|フライ|ライナー)')),
+    ('OUT', re.compile(r'(?:セーフティ|プッシュ|ドラッグ)バント[^。]*?(?:失策|エラー|野選|フィルダースチョイス)')),
+    ('1B',  re.compile(r'(?:セーフティ|プッシュ|ドラッグ)バント[^。]*?(?:一塁セーフ|出塁)')),
     ('SF',  re.compile(r'犠飛|犠牲フライ')),
     ('SAC', re.compile(r'バント')),
     # 併殺は「ダブルプレー」、失策出塁は「悪送球」「ファンブル」「後逸」などと書かれる（2026-11-26 追加）。
@@ -146,12 +185,26 @@ HIT_CODES    = {'1B', '2B', '3B', 'HR'}
 NON_AB_CODES = {'BB', 'IBB', 'HBP', 'SAC', 'SF'}
 
 
+# 一球速報の本文には、その打席の動画の見出しが続けて入っていることがある（2026年は約1,500打席）
+#   例: 「…レフトフライ 3アウト0:27【8回表】バファローズ・寺西成騎 …4奪三振…!! 2026年3月27日 …」
+# 見出しの「奪三振」「安打」などで打席結果を誤判定しないよう、動画の長さ「0:27【」から後ろを取り除く（2026-11-26）
+VIDEO_CAPTION = re.compile(r'\d{1,2}:\d{2}【')
+
+
+def strip_video_caption(text):
+    """本文から動画の見出し（「0:27【8回表】…」以降）を取り除く。文字列以外（NaN など）はそのまま返す"""
+    if not isinstance(text, str):
+        return text
+    m = VIDEO_CAPTION.search(text)
+    return text[:m.start()].rstrip() if m else text
+
+
 def classify_result(text) -> str:
     """
     本文テキストから打席結果コードを判定する。
     該当なしの場合は 'UNKNOWN' を返す（打率計算からは除外される）。
     """
-    s = str(text) if text is not None else ''
+    s = strip_video_caption(str(text)) if text is not None else ''
     for code, pattern in RESULT_PATTERNS:
         if pattern.search(s):
             return code
@@ -191,6 +244,7 @@ def add_result_columns(df_runs: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 def concat_details(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     all_df = pd.concat(dfs, ignore_index=True)
+    all_df['本文']     = all_df['本文'].map(strip_video_caption)   # 動画の見出しを除く
     all_df['アウト']   = pd.to_numeric(all_df['アウト'],   errors='coerce').fillna(0).astype(int)
     all_df['打席順']  = pd.to_numeric(all_df['打席順'],  errors='coerce').fillna(0).astype(int)
     all_df['打順']    = pd.to_numeric(all_df['打順'],    errors='coerce')
@@ -384,6 +438,20 @@ def get_team_avg_runs(df_team_runs: pd.DataFrame, team: str) -> tuple[float | No
     return float(sub['runs'].mean()), len(sub)
 
 
+def get_team_avg_runs_allowed(df_team_runs: pd.DataFrame, team: str) -> tuple[float | None, int]:
+    """
+    指定チームの1試合平均失点（＝同じ試合の相手チームの得点）と集計試合数を返す。
+    打者の予測と並べて見るのは、相手の攻撃力（得点）ではなく投手・守備の強さ（失点）の方なので、こちらを使う。
+    """
+    games = df_team_runs.loc[df_team_runs['team'] == team, 'game_id']
+    if games.empty:
+        return None, 0
+    opp = df_team_runs[df_team_runs['game_id'].isin(games) & (df_team_runs['team'] != team)]
+    if opp.empty:
+        return None, 0
+    return float(opp.groupby('game_id')['runs'].sum().mean()), int(opp['game_id'].nunique())
+
+
 # ============================================================
 # Step 3.6: 対戦球団ごとの打率・得点期待値（状況別ではない）
 # ============================================================
@@ -510,93 +578,9 @@ def build_batter_woba(df_raw: pd.DataFrame):
     df['wOBA']      = np.where(df['wOBA_den'] >= 10,
                                df['wOBA_num'] / df['wOBA_den'], np.nan)
     league_avg      = df[df['wOBA_den'] >= 30]['wOBA'].mean()
-    # wOBA_num / wOBA_den はベイズ収縮（predict_batter_woba）で使う
+    # wOBA_num / wOBA_den は対戦相手ごとの wOBA を合計し直すときに使う（validate.py の比較など）
     return (df[['選手名', '選手名_key', '区分名', '球団', '試合', '打席', 'wOBA', 'wOBA_num', 'wOBA_den']].copy(),
             float(league_avg))
-
-
-# ============================================================
-# Step 4.2: 対戦相手別 wOBA のベイズ収縮
-# ============================================================
-def predict_batter_woba(df_woba: pd.DataFrame, batter_name: str, opponent: str,
-                        league_avg: float, c: float = SHRINK_C) -> dict:
-    """
-    打者の「対戦相手別 wOBA」を、その打者の全体 wOBA に向けて収縮させた予測値を返す。
-
-        wOBA予測 = (PA × wOBA対戦 + C × wOBA全体) / (PA + C)
-                 = (wOBA分子_対戦 + C × wOBA全体) / (wOBA分母_対戦 + C)
-
-      PA        : 対戦相手との wOBA の分母（打席 − 敬遠 − 犠打）
-      wOBA全体  : 全対戦相手を合計した wOBA（分子の合計 / 分母の合計）
-      C         : 収縮の強さ（SHRINK_C = 20 打席分）
-
-    対戦打席が少ないほど全体 wOBA に近づき、多いほど対戦 wOBA に近づく。
-    以前の「分母 10 未満なら全体平均に切り替え」という不連続な扱いを置き換える。
-    選手データ自体がない場合はリーグ平均 wOBA を返す。
-
-    Returns
-    -------
-    dict: wOBA予測, wOBA対戦（生の値・分母0ならNone）, wOBA全体, 対戦PA, 対戦試合数, 収縮率（C/(PA+C)）, note
-    """
-    key = normalize_name(batter_name)
-    sub = df_woba[df_woba['選手名_key'] == key].copy()
-    if 'wOBA_num' not in sub.columns or 'wOBA_den' not in sub.columns:
-        # 古い build_batter_woba で作った表（wOBA と打席だけ）への互換: 打席数を分母とみなす
-        sub['wOBA_den'] = sub['打席'].where(sub['wOBA'].notna(), 0)
-        sub['wOBA_num'] = (sub['wOBA'] * sub['打席']).fillna(0)
-    num_all = float(sub['wOBA_num'].sum()) if not sub.empty else 0.0
-    den_all = float(sub['wOBA_den'].clip(lower=0).sum()) if not sub.empty else 0.0
-
-    if den_all <= 0:
-        return {'wOBA予測': league_avg, 'wOBA対戦': None, 'wOBA全体': None,
-                '対戦PA': 0, '対戦試合数': 0, '収縮率': 1.0,
-                'note': f'※ {batter_name} の打撃データなし → リーグ平均wOBAを使用'}
-
-    woba_all = num_all / den_all
-    hit = sub[sub['区分名'] == opponent]
-    num_o = float(hit['wOBA_num'].sum()) if not hit.empty else 0.0
-    den_o = float(hit['wOBA_den'].clip(lower=0).sum()) if not hit.empty else 0.0
-    games = int(hit['試合'].sum()) if not hit.empty else 0
-
-    pred   = (num_o + c * woba_all) / (den_o + c)
-    shrink = c / (den_o + c)
-    note = ''
-    if den_o <= 0:
-        note = f'※ {batter_name} vs {opponent} の対戦データなし → {batter_name} の全体wOBAを使用'
-    return {'wOBA予測': pred,
-            'wOBA対戦': (num_o / den_o) if den_o > 0 else None,
-            'wOBA全体': woba_all,
-            '対戦PA': int(den_o), '対戦試合数': games,
-            '収縮率': shrink, 'note': note}
-
-
-# ============================================================
-# Step 4.5: 選手の全対戦相手平均 wOBA
-#   （対戦相手別データがない場合のフォールバック用）
-# ============================================================
-def get_batter_avg_woba(df_woba: pd.DataFrame, batter_name: str) -> tuple[float | None, int, int]:
-    """
-    指定選手の「全対戦相手」を通した wOBA を、打席数で加重平均して返す。
-    対戦相手ごとのデータが1件もない、または全て打席不足で wOBA が NaN の場合は
-    (None, 0, 0) を返す（呼び出し側でリーグ平均にフォールバックする）。
-
-    Returns
-    -------
-    (avg_woba, total_pa, total_games)
-    """
-    key = normalize_name(batter_name)
-    sub = df_woba[df_woba['選手名_key'] == key]
-    if sub.empty:
-        return None, 0, 0
-
-    valid = sub[sub['wOBA'].notna() & (sub['打席'] > 0)]
-    if valid.empty:
-        return None, 0, 0
-
-    total_pa      = int(valid['打席'].sum())
-    weighted_woba = float((valid['wOBA'] * valid['打席']).sum() / total_pa)
-    total_games   = int(valid['試合'].sum())
-    return weighted_woba, total_pa, total_games
 
 
 # ============================================================
@@ -663,51 +647,6 @@ def build_season_batting(batter_df: pd.DataFrame) -> pd.DataFrame:
              '打率', '出塁率', '長打率', 'OPS', 'wOBA']
     return (g[[c for c in order if c in g.columns]]
             .sort_values('打席', ascending=False).reset_index(drop=True))
-
-
-# ============================================================
-# Step 5: 1場面の予測
-# ============================================================
-def predict_one(re24, df_woba, league_avg,
-                batter_name: str, opponent: str,
-                out: int, runner: str) -> dict:
-    runner_idx = RUNNER_MAP.get(runner, 0)
-    base_re    = re24.iloc[out, runner_idx]
-
-    # 対戦相手別 wOBA を全体 wOBA へベイズ収縮した値を打者の能力とする（ポスターの式）
-    est         = predict_batter_woba(df_woba, batter_name, opponent, league_avg)
-    batter_woba = est['wOBA予測']
-    pa          = est['対戦PA']
-    games       = est['対戦試合数']
-    note        = est['note']
-
-    adj_re = (base_re * (batter_woba / league_avg)
-              if not np.isnan(base_re) and league_avg > 0 else np.nan)
-
-    return {
-        'アウト':         out,
-        'ランナー':       runner if runner else '走者なし',
-        '打者wOBA':       round(batter_woba, 3),
-        '対戦wOBA(生)':   round(est['wOBA対戦'], 3) if est['wOBA対戦'] is not None else None,
-        '全体wOBA':       round(est['wOBA全体'], 3) if est['wOBA全体'] is not None else None,
-        '収縮率':         round(est['収縮率'], 3),
-        '対戦打席数':     pa,
-        '対戦試合数':     games,
-        '基礎RE24':       round(float(base_re), 3) if not np.isnan(base_re) else None,
-        '補正後期待得点': round(float(adj_re),  3) if not np.isnan(adj_re)  else None,
-        'note':           note,
-    }
-
-
-# ============================================================
-# Step 6: 全 24 場面テーブル
-# ============================================================
-def predict_all(re24, df_woba, league_avg,
-                batter_name: str, opponent: str) -> pd.DataFrame:
-    return pd.DataFrame([
-        predict_one(re24, df_woba, league_avg, batter_name, opponent, o, r)
-        for o in range(3) for r in RUNNER_LABEL
-    ])
 
 
 # ============================================================
@@ -786,11 +725,13 @@ def get_player_current_team(df_stats: pd.DataFrame, batter_name: str) -> str | N
 # モデル一括構築（DataFrame リストから）
 # ============================================================
 def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats_dir: str | None = None,
-                         df_players: pd.DataFrame | None = None):
+                         df_players: pd.DataFrame | None = None, df_games: pd.DataFrame | None = None):
     """
     dfs: GitHub から読み込んだ _details.csv の DataFrame リスト
     batter_df: 対戦相手別・球場別打撃成績（all_batters_situational.csv 相当）の DataFrame
     stats_dir: 過去3年成績 CSV が入っているディレクトリ（任意）
+    df_players: 選手マスタ（data/players.csv）
+    df_games: 試合日（data/games.csv）。「直近の試合」などを試合日の順に並べるのに使う
     """
     # 調子の判定はポストシーズンも含めた直近の試合で行う（オールスターだけ除く）
     dfs_recent = [d for d in dfs if 'game_id' in d.columns and len(d)
@@ -800,7 +741,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats
     if dfs:
         all_df   = concat_details(dfs)
         # calc_runs_after は時間がかかるので、ポストシーズンも含めて1回だけ計算し、レギュラーシーズン分を取り出す
-        runs_recent = calc_runs_after(concat_details(dfs_recent))
+        runs_recent = attach_game_dates(calc_runs_after(concat_details(dfs_recent)), df_games)
         df_runs  = runs_recent[runs_recent['game_id'].map(is_regular_season)].reset_index(drop=True)
         re24, counts = build_re24(df_runs)
         df_team_runs = build_team_game_runs(df_runs)
@@ -847,7 +788,7 @@ def build_model_from_dfs(dfs: list[pd.DataFrame], batter_df: pd.DataFrame, stats
 #   予測式（足し算の形。検証で乗法型より良かった）
 #     補正後期待得点 = RE24[アウト, 走者] + k × (w − リーグ平均wOBA)
 #     w = 打者wOBA + (投手の被wOBA − リーグ平均) + 相性[打者タイプ, 投手タイプ]
-#   k: 学習データで「打席の得点価値 ΔRE」を (打者wOBA − リーグ平均) に回帰した係数（約0.78）
+#   k: 学習データで「打席の得点価値 ΔRE」を (打席の wOBA の値 − リーグ平均) に回帰した係数（2026年で約0.74）
 #
 #   タイプ（2 × 2 = 4 通りずつ。相性は 4 × 4 = 16 マス）
 #     打者: この打席の打席（右/左。両打は投手の逆側）× 長打型/巧打型（ISO が中央値以上なら長打型）
@@ -922,7 +863,7 @@ def build_type_model(df_runs: pd.DataFrame, df_players: pd.DataFrame | None, re2
     Returns: dict
         lg       : リーグ平均 wOBA（打席加重）
         k        : 足し算の式の係数
-        batters  : DataFrame（index=打者ID）打席, wOBA, w（収縮後）, ISO, 長打型, 打, 選手名
+        batters  : DataFrame（index=打者ID）打席, wOBA, w（収縮後）, ISO, 長打型, 打, 選手名, 球団（2026年の最後の所属）
         pitchers : DataFrame（index=投手ID）対戦打者, 被wOBA, w（収縮後）, K%, 速球, 速球派, 投, 選手名, 球団
         matchup  : DataFrame（index=打者タイプ, columns=投手タイプ）相性（wOBA の差）
         matchup_n: 同じ形の打席数
@@ -935,12 +876,24 @@ def build_type_model(df_runs: pd.DataFrame, df_players: pd.DataFrame | None, re2
 
     lg = float(df['woba_num'].sum() / df['woba_den'].sum())
 
+    # 打者・投手の球団（短縮名）。移籍した選手は最後に出場した試合（試合日の順）の球団にする
+    top = df['イニング'].astype(str).str.contains('表')
+    raw_names = pd.unique(pd.concat([df['away_team_raw'], df['home_team_raw']]).dropna())
+    team_map = {t: normalize_team_name(t) for t in raw_names}
+    df['打者球団'] = df['away_team_raw'].where(top, df['home_team_raw']).map(team_map)
+    df['守備球団'] = df['home_team_raw'].where(top, df['away_team_raw']).map(team_map)
+    df['順'] = game_order(df)
+    by_order = df.sort_values('順', kind='stable')
+    last_bat_team = by_order.groupby('打者ID')['打者球団'].last()
+    last_pit_team = by_order.groupby('投手ID')['守備球団'].last()
+
     # --- 打者 ---
     b = df.groupby('打者ID').agg(打席=('woba_den', 'sum'), num=('woba_num', 'sum'),
                                 ab=('is_bf', 'sum'), tb_extra=('tb_extra', 'sum'),
                                 選手名=('選手名', 'first'))
     b['wOBA'] = (b['num'] / b['打席']).where(b['打席'] > 0)
     b['w'] = (b['num'] + c_bat * lg) / (b['打席'] + c_bat)
+    b['球団'] = b.index.to_series().map(last_bat_team)
     lg_iso = b['tb_extra'].sum() / b['ab'].sum()
     b['ISO'] = (b['tb_extra'] + C_ISO * lg_iso) / (b['ab'] + C_ISO)
     iso_cut = b.loc[b['打席'] >= MIN_PA_FOR_THRESHOLD, 'ISO'].median()
@@ -960,14 +913,15 @@ def build_type_model(df_runs: pd.DataFrame, df_players: pd.DataFrame | None, re2
         p['速球'] = p.index.to_series().map(pl['球種データ'].apply(fastball_velocity)) if '球種データ' in pl else np.nan
         p['速球'] = pd.to_numeric(p['速球'], errors='coerce')
         p['投'] = p.index.to_series().map(pl['投'])
-        p['球団'] = p.index.to_series().map(pl['球団'])
+        # 球団は一球速報で最後に投げた試合の球団。一球速報で取れないときだけ選手マスタ（現在の所属）
+        p['球団'] = p.index.to_series().map(last_pit_team).fillna(p.index.to_series().map(pl['球団']))
         p['選手名'] = p.index.to_series().map(pl['選手名']).fillna(p['選手名'])
         b['打'] = b.index.to_series().map(pl['打'])
         b['選手名'] = b.index.to_series().map(pl['選手名']).fillna(b['選手名'])
     else:
         p['速球'] = np.nan
         p['投'] = None
-        p['球団'] = None
+        p['球団'] = p.index.to_series().map(last_pit_team)
         b['打'] = None
     ref = p[p['bf'] >= MIN_PA_FOR_THRESHOLD]
     zk = _zscore(p['K%'], ref['K%'])
@@ -1196,25 +1150,30 @@ def build_form_table(df_runs: pd.DataFrame, model: dict, as_of_game_id=None) -> 
     """
     全打者・全投手の直近の調子を判定する。
       df_runs: calc_runs_after の出力（オールスターは除いて渡す。ポストシーズンは含めてよい）
-      as_of_game_id: この試合ID より前の試合だけを見る（None なら全試合）
+      as_of_game_id: この試合より前（試合日の順）の試合だけを見る（None なら全試合）
+    「直近」は試合日の順（df_runs に '日付' の列があるとき。なければ試合ID の順）。
     Returns: {'打者': DataFrame(index=打者ID), '投手': DataFrame(index=投手ID)}
-             列: 直近試合数, 直近打席, 直近wOBA, シーズンwOBA, z, 調子
+             列: 直近試合数, 直近打席, 直近wOBA, シーズンwOBA, z, 調子, 最終試合
     """
     df = add_woba_columns(add_result_columns(df_runs))
     for c in ('打者ID', '投手ID'):
         df[c] = df[c].apply(normalize_player_id)
     df['gid'] = df['game_id'].astype(int)
+    df['順'] = game_order(df)
     if as_of_game_id is not None:
-        df = df[df['gid'] < int(as_of_game_id)]
+        cut = df.loc[df['gid'] == int(as_of_game_id), '順']
+        df = df[df['順'] < cut.iloc[0]] if len(cut) else df[df['gid'] < int(as_of_game_id)]
+    gid_of = dict(zip(df['順'], df['gid']))
     out = {}
     for role, col, n_games, season, sign in (('打者', '打者ID', FORM_N_GAMES_BAT, model['batters']['w'], 1),
                                               ('投手', '投手ID', FORM_N_GAMES_PIT, model['pitchers']['w'], -1)):
         d = df[df[col].notna()]
-        last = (d[['gid', col]].drop_duplicates().sort_values('gid')
+        last = (d[['順', 'gid', col]].drop_duplicates().sort_values('順')
                 .groupby(col).tail(n_games))
-        recent = d.merge(last, on=['gid', col])
+        recent = d.merge(last[['gid', col]], on=['gid', col])
         g = recent.groupby(col).agg(直近試合数=('gid', 'nunique'), num=('woba_num', 'sum'),
-                                    直近打席=('woba_den', 'sum'), 最終試合=('gid', 'max'))
+                                    直近打席=('woba_den', 'sum'), 最終順=('順', 'max'))
+        g['最終試合'] = g.pop('最終順').map(gid_of)
         g['直近wOBA'] = (g['num'] / g['直近打席']).where(g['直近打席'] > 0)
         g['シーズンwOBA'] = g.index.to_series().map(season).fillna(model['lg'])
         g['z'] = (g['num'] - g['直近打席'] * g['シーズンwOBA']) / (WOBA_PA_SD * np.sqrt(g['直近打席'].clip(lower=1)))
@@ -1283,8 +1242,8 @@ RISP_BITS = {'2塁', '3塁', '1,2塁', '1,3塁', '2,3塁', '満塁'}   # 得点�
 def build_pa_table(df_runs: pd.DataFrame, df_players: pd.DataFrame | None, model: dict) -> pd.DataFrame:
     """
     条件別 wOBA 用の打席の表（calc_runs_after の出力。オールスターを除き、ポストシーズンは含めてよい）。
-    列: gid, 区分, 打者ID, 打者名, 投手ID, 投手名, 打者球団, 投手球団, ホーム/ビジター, イニング番号, アウト, 走者,
-        結果, 打者の打席, 投手の腕, 打者タイプ, 投手タイプ, woba_num, woba_den
+    列: gid, 日付, 順（試合日の順）, 区分, 打者ID, 打者名, 投手ID, 投手名, 打者球団, 投手球団, ホーム/ビジター,
+        イニング番号, アウト, 走者, 結果, 打者の打席, 投手の腕, 打者タイプ, 投手タイプ, woba_num, woba_den
     """
     d = attach_player_info(add_woba_columns(add_result_columns(df_runs)), df_players)
     d = d[d['結果'] != 'UNKNOWN']
@@ -1298,6 +1257,8 @@ def build_pa_table(df_runs: pd.DataFrame, df_players: pd.DataFrame | None, model
     gid = d['game_id'].astype(int)
     out = pd.DataFrame({
         'gid': gid,
+        '日付': d['日付'] if '日付' in d.columns else None,
+        '順': game_order(d),
         '区分': np.where(gid.isin(POSTSEASON_IDS), 'ポストシーズン', 'レギュラーシーズン'),
         '打者ID': d['打者ID'], '投手ID': d['投手ID'],
         '打者名': d['打者ID'].map(names).fillna(d['選手名']),

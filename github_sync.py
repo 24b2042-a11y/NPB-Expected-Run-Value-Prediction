@@ -18,6 +18,7 @@ from github import Github, GithubException
 BATTER_CSV_PATH  = 'data/all_batters_situational.csv'
 PITCHER_CSV_PATH = 'data/all_pitchers.csv'
 PLAYERS_CSV_PATH = 'data/players.csv'
+GAMES_CSV_PATH   = 'data/games.csv'      # 試合ID → 試合日（振替試合の並び順に使う）
 PLAYERS_STR_COLS = {'選手ID': str, '背番号': str}
 
 # オールスター（試合IDがポストシーズンより大きい）。新規取得の開始IDを決めるときに除く
@@ -199,6 +200,26 @@ def load_players_csv_from_github(
 ) -> pd.DataFrame | None:
     # 選手ID・背番号は文字列で読む（数値で読むと育成選手の背番号「011」が「11」になる）
     return load_csv_from_github(token, repo_name, path, branch, dtype=PLAYERS_STR_COLS)
+
+
+def save_games_csv_to_github(
+    token: str,
+    repo_name: str,
+    df: pd.DataFrame,
+    branch: str = 'main',
+    path: str = GAMES_CSV_PATH,
+) -> tuple[bool, str]:
+    repo = get_repo(token, repo_name)
+    return upsert_csv_at_path(repo, df, path, '[auto] update games.csv', branch)
+
+
+def load_games_csv_from_github(
+    token: str,
+    repo_name: str,
+    branch: str = 'main',
+    path: str = GAMES_CSV_PATH,
+) -> pd.DataFrame | None:
+    return load_csv_from_github(token, repo_name, path, branch, dtype={'試合ID': str, '日付': str})
 
 
 # ============================================================

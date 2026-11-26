@@ -238,7 +238,7 @@ if __name__ == '__main__':
 
     df_new = scrape_players(ids, sleep_sec=args.sleep, on_progress=_p)
     df = merge_players(df_old, df_new)
-    df.to_csv(out_path, index=False, encoding='utf-8-sig')
+    df.to_csv(out_path, index=False, encoding='utf-8-sig', lineterminator='\n')   # 改行は LF
     print(f'保存: {out_path}（{len(df)} 人）')
     for msg in df_new.attrs.get('failed_ids', []):
         print('失敗:', msg)

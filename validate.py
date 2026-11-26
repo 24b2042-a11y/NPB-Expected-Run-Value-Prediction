@@ -12,8 +12,8 @@ validate.py — 得点期待値予測の検証（学習データとテストデ�
                  RE は学習データの RE24。イニング最後の打席は RE(打席後) = 0
 
 予測の形（打者能力 w = その打者の wOBA 予測、lg = リーグ平均 wOBA）
-    乗法型（現在のアプリの式）: runs_after = RE × (w / lg)、        dRE = RE × (w / lg − 1)
-    加法型（wRAA 型）        : runs_after = RE + k × (w − lg)、     dRE = k × (w − lg)
+    乗法型（以前のアプリの式）: runs_after = RE × (w / lg)、        dRE = RE × (w / lg − 1)
+    加法型（wRAA 型。2026-11-26 からアプリの式）: runs_after = RE + k × (w − lg)、 dRE = k × (w − lg)
         k は学習データで dRE を (w − lg) に回帰して求める（切片なし。打者全体 wOBA を使用）
 
 打者能力 w の作り方
@@ -21,7 +21,7 @@ validate.py — 得点期待値予測の検証（学習データとテストデ�
     全体        : その打者の全体 wOBA（全対戦相手の合計）
     全体収縮    : 全体 wOBA をリーグ平均へ収縮（C_lg 打席分）
     対戦生      : 対戦相手別 wOBA（分母 10 未満なら全体 wOBA。以前のアプリの方式）
-    対戦収縮C   : 対戦相手別 wOBA を全体 wOBA へ収縮（core.predict_batter_woba、C を変える）
+    対戦収縮C   : 対戦相手別 wOBA を全体 wOBA へ収縮（以前のアプリの方式。C を変える）
     対戦収縮C+全体収縮 : 二段階（全体 wOBA をリーグ平均へ収縮してから、対戦 wOBA をそこへ収縮）
 
 wOBA の元データ（--woba-source）
@@ -85,14 +85,28 @@ def load_details_local(data_dir: str = GAMEDATA_DIR) -> list[pd.DataFrame]:
     return dfs
 
 
-def split_games(game_ids: list[int], split: str, test_frac: float) -> tuple[set, set]:
-    """学習・テストの試合IDに分ける"""
-    regular = sorted(g for g in game_ids if g not in POSTSEASON_IDS and g not in ALLSTAR_IDS)
+def load_game_dates() -> dict:
+    """data/games.csv の {試合ID(int): 試合日 'YYYY-MM-DD'}。ファイルがなければ空"""
+    path = os.path.join(BASE_DIR, 'data', 'games.csv')
+    if not os.path.exists(path):
+        return {}
+    g = pd.read_csv(path, encoding='utf-8-sig', dtype=str)
+    return {int(i): d for i, d in zip(g['試合ID'], g['日付']) if isinstance(d, str)}
+
+
+def split_games(game_ids: list[int], split: str, test_frac: float, dates: dict | None = None) -> tuple[set, set]:
+    """
+    学習・テストの試合IDに分ける。
+    season-tail は試合日の順（dates）で後ろ test_frac をテストにする。振替試合は試合ID が離れた大きい番号なので、
+    ID の順では日付の順にならない（2026-11-26）。試合日がない試合は ID の順で後ろに並べる。
+    """
+    dates = dates or {}
+    regular = sorted((g for g in game_ids if g not in POSTSEASON_IDS and g not in ALLSTAR_IDS),
+                     key=lambda g: (dates.get(g, '9999'), g))
     if split == 'postseason':
         test = {g for g in game_ids if g in POSTSEASON_IDS}
         return set(regular), test
     if split == 'season-tail':
-        # 試合IDはおおむね日付順なので、ID の大きい方 test_frac をテストにする
         n_test = int(round(len(regular) * test_frac))
         return set(regular[:-n_test]), set(regular[-n_test:])
     raise ValueError(f'unknown split: {split}')
@@ -130,7 +144,7 @@ def add_targets(df_runs: pd.DataFrame, re24: pd.DataFrame) -> pd.DataFrame:
 def build_woba_from_pbp(df_train: pd.DataFrame) -> pd.DataFrame:
     """
     学習期間の打席データから、打者×対戦球団の wOBA テーブルを作る（build_batter_woba と同じ列）。
-      分子 = 0.70×四球(敬遠除く) + 0.73×死球 + 0.89×単打 + 1.27×二塁打 + 1.61×三塁打 + 2.10×本塁打
+      分子 = core.WOBA_W の係数 ×（四球(敬遠除く)・死球・単打・二塁打・三塁打・本塁打）。NPB 2026 の係数
       分母 = 打席 − 敬遠 − 犠打（打席 = 結果を判定できた行。UNKNOWN は除く）
     """
     df = df_train[df_train['結果'] != 'UNKNOWN'].copy()
@@ -302,7 +316,7 @@ def run(split: str = 'postseason', test_frac: float = 0.2, woba_source: str = 'p
     if woba_source == 'pbp' and '打者ID' in df_runs.columns:
         df_runs['batter_key'] = df_runs['打者ID'].apply(core.normalize_player_id).fillna(df_runs['batter_key'])
 
-    train_ids, test_ids = split_games(sorted(df_runs['game_id_int'].unique()), split, test_frac)
+    train_ids, test_ids = split_games(sorted(df_runs['game_id_int'].unique()), split, test_frac, load_game_dates())
     if not test_ids:
         raise SystemExit('テストの試合がありません。ポストシーズンを取得してください: '
                          'python scraper.py --ids 2021039474-2021039495')
@@ -406,6 +420,8 @@ def validate_simulation(n_sims: int = 300, n_regular: int = 200, seed: int = 0) 
     import game_sim
     dfs = load_details_local()
     runs = core.calc_runs_after(core.concat_details(dfs))
+    dates = load_game_dates()
+    runs['日付'] = runs['game_id'].astype(int).map(dates)
     gid = runs['game_id'].astype(int)
     reg = runs[~gid.isin(POSTSEASON_IDS | ALLSTAR_IDS)]
     re24, _ = build_re24(reg)

@@ -215,7 +215,7 @@ def scrape_all_batters(sleep_sec: float = 1.5, on_progress=None) -> pd.DataFrame
 
     on_progress(team_idx, n_teams, team_name, player_idx, n_players, player_name)
     """
-    all_rows, failed_teams, failed_players = [], [], []
+    all_rows, failed_teams, failed = [], [], []   # failed: [(球団名, 選手の dict, エラー名), ...]
     n_teams = len(TEAMS)
 
     for ti, (team_name, code, league) in enumerate(TEAMS):
@@ -234,7 +234,7 @@ def scrape_all_batters(sleep_sec: float = 1.5, on_progress=None) -> pd.DataFrame
                 stats = scrape_player_stats(p['詳細URL'], sleep_sec=sleep_sec)
             except Exception as e:
                 stats = []
-                failed_players.append(f"{team_name} {p['選手名']}（{type(e).__name__}）")
+                failed.append((team_name, p, type(e).__name__))
 
             for s in stats:
                 row = {'球団': team_name, '選手名': p['選手名'], 'URL': p['詳細URL']}
@@ -243,6 +243,20 @@ def scrape_all_batters(sleep_sec: float = 1.5, on_progress=None) -> pd.DataFrame
 
             if on_progress:
                 on_progress(ti, n_teams, team_name, pi + 1, n_players, p['選手名'])
+
+    # 詳細ページの取得に失敗した選手は、最後に間隔を空けてもう一度だけ取り直す
+    # （2026-11-26: 一時的な失敗で近本・源田・谷川原が抜けたまま保存されていた）
+    failed_players = []
+    for team_name, p, err in failed:
+        try:
+            stats = scrape_player_stats(p['詳細URL'], sleep_sec=sleep_sec * 2)
+        except Exception as e:
+            failed_players.append(f"{team_name} {p['選手名']}（{type(e).__name__}）")
+            continue
+        for s in stats:
+            row = {'球団': team_name, '選手名': p['選手名'], 'URL': p['詳細URL']}
+            row.update(s)
+            all_rows.append(row)
 
     return build_batter_df(all_rows, failed_teams, failed_players)
 
@@ -299,5 +313,6 @@ if __name__ == '__main__':
         print('⚠', msg)
     if problems and not args.force:
         raise SystemExit('問題があるため保存しませんでした（--force で保存）')
-    df.to_csv(out_path, index=False, encoding='utf-8-sig')
+    # 改行は LF（Windows の既定の CRLF だと、中身が同じでも git の差分になる）
+    df.to_csv(out_path, index=False, encoding='utf-8-sig', lineterminator='\n')
     print('保存:', out_path)
