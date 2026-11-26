@@ -328,7 +328,11 @@ def render_pitcher_stats(df_pitchers, opponent: str | None = None, key_prefix: s
         st.warning(f'「{query}」に一致する投手が見つかりません。')
         return
 
-    label = st.selectbox('投手を選択', cand['ラベル'].tolist(), key=f'{key_prefix}_select')
+    labels = cand['ラベル'].tolist()
+    label = st.selectbox('投手を選択', labels, index=_first_index(labels, query, f'{key_prefix}_select'),
+                         placeholder='投手を選んでください', key=f'{key_prefix}_select')
+    if label is None:
+        return
     sel   = cand[cand['ラベル'] == label].iloc[0]
     mine  = df_pitchers[(df_pitchers['選手名_key'] == sel['選手名_key'])
                         & (df_pitchers['TM'] == sel['TM'])]
@@ -591,7 +595,11 @@ def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers, df_seas
         if not candidates:
             st.warning('条件に一致する選手が見つかりません。')
         else:
-            batter = st.selectbox('選手を選択', candidates, key='players_batter_select')
+            batter = st.selectbox('選手を選択', candidates, index=_first_index(candidates, query, 'players_batter_select'),
+                                  placeholder='選手を選んでください', key='players_batter_select')
+        if candidates and batter is None:
+            st.info('選手名を入力するか、一覧から選手を選んでください。')
+        elif candidates:
             team = get_player_current_team(df_career, batter)
             st.markdown(f'### {batter}' + (f'　{team}' if team else ''))
             render_batter_stats(batter, df_woba, df_career, df_team_batting_stats, df_season)
@@ -607,6 +615,14 @@ def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers, df_seas
 # ============================================================
 # メインページ: 得点期待値予測 + 選手個人成績
 # ============================================================
+def _first_index(options, query, key) -> None:
+    """選手の選択欄の初期値: 最初は空欄。検索で1人に絞れたときだけ、その選手を選んだ状態にする
+    （key 付きの selectbox は選択肢が変わっても index が反映されないため、session_state で選ぶ）"""
+    if query and len(options) == 1 and st.session_state.get(key) not in options:
+        st.session_state[key] = options[0]
+    return None
+
+
 def _form_caption(f: dict | None, role: str) -> str:
     """直近の成績からの調子の判定を1行で"""
     if not f:
@@ -631,10 +647,10 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     st.divider()
 
     # ---- 選手名テキスト入力（インクリメンタルサーチ） ----
-    # 一球速報に打席のある打者だけ（nf3 にだけいる打者は投手などで、打席は合計でも20打席に満たない）
-    tm_names = set(type_model['batters']['選手名'].apply(normalize_name)) if type_model is not None else None
-    all_batters = sorted(n for n in df_woba['選手名'].unique().tolist()
-                         if tm_names is None or normalize_name(n) in tm_names)
+    # 打者の一覧は一球速報に打席のある選手（予測に使うデータと同じ）。nf3 の打者一覧には
+    # 近本・源田・谷川原の3人が入っていないため、nf3 からは作らない（2026-11-26）
+    all_batters = (sorted(type_model['batters']['選手名'].dropna().unique().tolist()) if type_model is not None
+                   else sorted(df_woba['選手名'].unique().tolist()))
     query = st.text_input('🔍 選手名を入力', placeholder='例: 田中、鈴木、村上')
 
     if query:
@@ -646,7 +662,11 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
         st.warning(f'「{query}」に一致する選手が見つかりません。')
         return
 
-    batter = st.selectbox('選手を選択', candidates, key='batter_select')
+    batter = st.selectbox('選手を選択', candidates, index=_first_index(candidates, query, 'batter_select'),
+                          placeholder='選手を選んでください', key='batter_select')
+    if batter is None:
+        st.info('選手名を入力するか、一覧から選手を選ぶと予測を表示します。')
+        return
 
     # ---- 選手プロフィール（所属球団 + 過去3年成績） ----
     team = get_player_current_team(df_career, batter)
@@ -1545,9 +1565,13 @@ def page_woba(type_model):
     if cand.empty:
         st.warning('一致する選手がいません。')
         return
-    pid = st.selectbox('選手', list(cand.index),
+    pid = st.selectbox('選手', list(cand.index), index=_first_index(list(cand.index), q, f'woba_player_{role}'),
+                       placeholder='選手を選んでください',
                        format_func=lambda x: f"{cnt.loc[x, '名前']}（{cnt.loc[x, '球団']}／{int(cnt.loc[x, '打席'])} 打席）",
                        key=f'woba_player_{role}')
+    if pid is None:
+        st.info('選手名を入力するか、一覧から選手を選んでください。')
+        return
 
     st.markdown('**条件**')
     c1, c2, c3 = st.columns(3)
