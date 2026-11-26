@@ -18,18 +18,21 @@ import importlib
 # Streamlit Cloud は、GitHub に push された新しい app.py を実行しても、前回読み込んだ
 # 古い core.py などをメモリ（sys.modules）に残したままにすることがある。その状態で
 # 新しく追加した名前を import すると ImportError になるため、自作モジュールは毎回
-# 読み込み直す（scraper → core → github_sync → player_scraper の依存順）。
-import scraper as _scraper, core as _core, github_sync as _github_sync, player_scraper as _player_scraper
-import game_sim as _game_sim
-for _m in (_scraper, _core, _game_sim, _github_sync, _player_scraper):
-    importlib.reload(_m)
+# 読み込み直す。依存する順（scraper → core → game_sim → github_sync → player_scraper）に
+# 1つずつ「読み込み直してから次を import する」こと。まとめて import してから reload すると、
+# game_sim の import 時点ではまだ古い core が残っていて ImportError になる（2026-11-26）。
+import sys
+_LOCAL_MODULES = []
+for _name in ('scraper', 'core', 'game_sim', 'github_sync', 'player_scraper'):
+    _LOCAL_MODULES.append(importlib.reload(sys.modules[_name]) if _name in sys.modules
+                          else importlib.import_module(_name))
 
 # st.cache_data のキャッシュは「キャッシュする関数のコード」と引数で判定されるため、
 # core.py だけを直すと古い core.py で作った結果（列の足りない df_woba など）が使われ続ける。
 # core.py などの中身のハッシュを引数として渡し、自作モジュールが変わったらキャッシュを作り直す。
 import hashlib
 CODE_VERSION = hashlib.md5(b''.join(
-    open(_m.__file__, 'rb').read() for _m in (_scraper, _core, _game_sim, _github_sync, _player_scraper)
+    open(_m.__file__, 'rb').read() for _m in _LOCAL_MODULES
 )).hexdigest()[:12]
 
 from core import (
