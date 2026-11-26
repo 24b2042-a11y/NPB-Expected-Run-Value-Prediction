@@ -321,7 +321,7 @@ def render_pitcher_stats(df_pitchers, opponent: str | None = None, key_prefix: s
         else:
             cand = narrowed
 
-    query = st.text_input('🔍 投手名を入力', placeholder='例: 村上、戸郷', key=f'{key_prefix}_query')
+    query = st.text_input('🔍 投手名を入力', key=f'{key_prefix}_query')
     if query:
         cand = cand[cand['選手名'].str.contains(query, regex=False)]
     if cand.empty:
@@ -584,8 +584,7 @@ def page_players(df_woba, df_career, df_team_batting_stats, df_pitchers, df_seas
             teams = sorted(names['所属'].dropna().unique().tolist())
             team_sel = st.selectbox('球団（所属）', ['全球団'] + teams, key='players_team')
         with col_q:
-            query = st.text_input('🔍 選手名を入力', placeholder='例: 田中、鈴木、村上',
-                                  key='players_batter_query')
+            query = st.text_input('🔍 選手名を入力', key='players_batter_query')
 
         pool = names if team_sel == '全球団' else names[names['所属'] == team_sel]
         candidates = sorted(pool['選手名'].unique().tolist())
@@ -651,7 +650,7 @@ def page_main(re24, counts, df_woba, league_avg, n_games, n_pa, df_career, df_te
     # 近本・源田・谷川原の3人が入っていないため、nf3 からは作らない（2026-11-26）
     all_batters = (sorted(type_model['batters']['選手名'].dropna().unique().tolist()) if type_model is not None
                    else sorted(df_woba['選手名'].unique().tolist()))
-    query = st.text_input('🔍 選手名を入力', placeholder='例: 田中、鈴木、村上')
+    query = st.text_input('🔍 選手名を入力')
 
     if query:
         candidates = [b for b in all_batters if query in b]
@@ -1560,7 +1559,7 @@ def page_woba(type_model):
 
     cnt = (pa_all.groupby(f'{me}ID').agg(名前=(f'{me}名', 'first'), 球団=('自球団', 'last'), 打席=('結果', 'size'))
            .sort_values('打席', ascending=False))
-    q = st.text_input('🔍 選手名を入力', key='woba_query', placeholder='例: 佐藤、村上')
+    q = st.text_input('🔍 選手名を入力', key='woba_query')
     cand = cnt[cnt['名前'].astype(str).str.contains(q)] if q else cnt
     if cand.empty:
         st.warning('一致する選手がいません。')
